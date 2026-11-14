@@ -89,6 +89,7 @@ body,
 
 /* —— Shell —— */
 .shell {
+  position: relative;
   height: 100%;
   display: flex;
   flex-direction: column;
@@ -122,30 +123,47 @@ body,
 
 .brand-block {
   display: flex;
-  align-items: baseline;
-  gap: 12px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
 }
 
 .brand-bb {
-  font-family: var(--font-display);
-  font-size: clamp(4rem, 9vw, 5.5rem);
-  font-weight: 700;
-  line-height: 0.85;
-  letter-spacing: 0.02em;
-  color: #f0e6d8;
+  font-family: var(--font-game);
+  font-size: clamp(4.4rem, 10vw, 6rem);
+  font-weight: 400;
+  line-height: 0.9;
+  letter-spacing: 0.04em;
+  color: #f2ebe3;
   text-transform: uppercase;
-  text-shadow: 0 1px 10px rgba(0, 0, 0, 0.45);
+  text-shadow: 0 2px 12px rgba(0, 0, 0, 0.55);
 }
 
 .brand-emu {
   font-family: var(--font-display);
-  font-size: 1.15rem;
-  font-weight: 600;
-  letter-spacing: 0.2em;
-  color: #1a100c;
-  background: var(--blood);
-  padding: 0.28rem 0.55rem 0.18rem;
-  align-self: center;
+  font-size: 1.05rem;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  color: #f2ebe3;
+  background: var(--blood-hot);
+  padding: 0.32rem 0.7rem 0.28rem;
+  line-height: 1;
+}
+
+.version-badge {
+  position: absolute;
+  left: 36px;
+  bottom: 14px;
+  z-index: 12;
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 500;
+  font-size: 0.78rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: rgba(242, 235, 227, 0.72);
+  text-shadow: 0 1px 6px rgba(0, 0, 0, 0.65);
+  pointer-events: none;
 }
 
 .dock {

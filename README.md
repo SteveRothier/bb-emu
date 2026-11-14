@@ -19,3 +19,11 @@ Prérequis : Node.js, Rust, WebView2.
 Endpoint updater :
 
 `https://github.com/SteveRothier/bb-emu/releases/latest/download/latest.json`
+
+## Nettoyage
+
+`cleanup.bat` — désinstalle l’ancienne install `BB EMU`, corrige les raccourcis en double, refresh des icônes.
+
+## Logs
+
+Écrits dans le dossier logs Tauri de l’app (`bb-emu.log`) : démarrage stub, lobby, détection jeu, erreurs.

@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import { check } from "@tauri-apps/plugin-updater";
@@ -19,6 +20,7 @@ import "./styles.css";
 type Config = {
   port: number;
   lobbyName: string;
+  lobbies: string[];
   gamePath: string;
 };
 
@@ -31,11 +33,22 @@ type StubStatus = {
 const DEFAULT_CONFIG: Config = {
   port: 7891,
   lobbyName: "StubLobby",
+  lobbies: ["StubLobby", "Public", "Friends"],
   gamePath: "",
 };
 const PORT_MAX_LEN = 5;
 const LOBBY_MAX_LEN = 16;
 const win = getCurrentWindow();
+
+function normalizeLobbies(list: unknown, current: string): string[] {
+  const raw = Array.isArray(list) ? list.map(String) : [];
+  const cleaned = raw
+    .map((s) => s.trim().slice(0, LOBBY_MAX_LEN))
+    .filter(Boolean);
+  if (current && !cleaned.includes(current)) cleaned.unshift(current);
+  if (!cleaned.length) cleaned.push(...DEFAULT_CONFIG.lobbies);
+  return [...new Set(cleaned)].slice(0, 12);
+}
 
 function icon(node: IconNode, size = 16): SVGElement {
   const el = createElement(node);
@@ -52,15 +65,17 @@ function mountIcon(target: Element, node: IconNode, size = 16) {
 function loadConfig(): Config {
   try {
     const raw = localStorage.getItem("bb-emu-config");
-    if (!raw) return { ...DEFAULT_CONFIG };
+    if (!raw) return { ...DEFAULT_CONFIG, lobbies: [...DEFAULT_CONFIG.lobbies] };
     const parsed = JSON.parse(raw) as Partial<Config>;
+    const lobbyName = String(parsed.lobbyName || DEFAULT_CONFIG.lobbyName).slice(0, LOBBY_MAX_LEN);
     return {
       port: Number(parsed.port) || DEFAULT_CONFIG.port,
-      lobbyName: String(parsed.lobbyName || DEFAULT_CONFIG.lobbyName).slice(0, LOBBY_MAX_LEN),
+      lobbyName,
+      lobbies: normalizeLobbies(parsed.lobbies, lobbyName),
       gamePath: String(parsed.gamePath || ""),
     };
   } catch {
-    return { ...DEFAULT_CONFIG };
+    return { ...DEFAULT_CONFIG, lobbies: [...DEFAULT_CONFIG.lobbies] };
   }
 }
 
@@ -145,6 +160,7 @@ app.innerHTML = `
         </div>
       </aside>
     </div>
+    <p class="version-badge" id="app-version">v…</p>
   </div>
 `;
 
@@ -177,6 +193,7 @@ const statusDot = document.querySelector<HTMLElement>("#status-dot")!;
 const statusText = document.querySelector<HTMLElement>("#status-text")!;
 const bootPanel = document.querySelector<HTMLElement>("#boot-panel")!;
 const bootBarFill = document.querySelector<HTMLElement>("#boot-bar-fill")!;
+const appVersionEl = document.querySelector<HTMLElement>("#app-version")!;
 
 document.querySelector("#win-min")!.addEventListener("click", () => win.minimize());
 document.querySelector("#win-close")!.addEventListener("click", () => win.close());
@@ -189,6 +206,14 @@ let busy = false;
 cfgPort.value = String(config.port).slice(0, PORT_MAX_LEN);
 cfgLobby.value = config.lobbyName.slice(0, LOBBY_MAX_LEN);
 cfgGameText.textContent = shortPath(draftPath);
+
+void getVersion()
+  .then((v) => {
+    appVersionEl.textContent = `v${v}`;
+  })
+  .catch(() => {
+    appVersionEl.textContent = "v?";
+  });
 
 cfgPort.addEventListener("input", () => {
   cfgPort.value = cfgPort.value.replace(/\D/g, "").slice(0, PORT_MAX_LEN);
@@ -295,9 +320,11 @@ cfgGameBtn.addEventListener("click", async (e) => {
 });
 
 btnSave.addEventListener("click", () => {
+  const lobbyName = (cfgLobby.value.trim() || "StubLobby").slice(0, LOBBY_MAX_LEN);
   config = {
     port: Math.min(65535, Math.max(1, Number(cfgPort.value) || 7891)),
-    lobbyName: (cfgLobby.value || "StubLobby").slice(0, LOBBY_MAX_LEN),
+    lobbyName,
+    lobbies: normalizeLobbies([...config.lobbies, lobbyName], lobbyName),
     gamePath: draftPath,
   };
   cfgPort.value = String(config.port);
@@ -305,7 +332,7 @@ btnSave.addEventListener("click", () => {
   cfgGameText.textContent = shortPath(config.gamePath);
   saveConfig(config);
   openConfig(false);
-  if (stubOnline) setStatus("ok", "En ligne");
+  if (stubOnline) setStatus("ok", `En ligne — ${config.lobbyName}`);
   else flashStatus("ok", "Config enregistrée");
 });
 
@@ -352,7 +379,7 @@ async function refreshStatus() {
       setStatus("err", "Stub manquant — réinstalle BB-EMU");
       return;
     }
-    if (st.running) setStatus("ok", "En ligne");
+    if (st.running) setStatus("ok", `En ligne — ${config.lobbyName}`);
     else setStatus("idle", "");
   } catch (e) {
     flashStatus("err", shortErr(e instanceof Error ? e.message : String(e)));
@@ -388,19 +415,35 @@ btnLaunch.addEventListener("click", async () => {
       gamePath: config.gamePath,
     });
     stubOnline = true;
-    if (msg.includes("En ligne")) setStatus("ok", "En ligne");
+    if (msg.includes("En ligne")) setStatus("ok", `En ligne — ${config.lobbyName}`);
     else if (/échec|introuvable/i.test(msg)) flashStatus("err", shortErr(msg));
-    else setStatus("ok", shortErr(msg) || "En ligne");
+    else setStatus("ok", shortErr(msg) || `En ligne — ${config.lobbyName}`);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     if (msg.includes("déjà")) {
       stubOnline = true;
-      setStatus("ok", "En ligne");
+      setStatus("ok", `En ligne — ${config.lobbyName}`);
     } else {
       flashStatus("err", shortErr(msg));
     }
   }
 });
+
+async function autoDetectGame() {
+  if (config.gamePath) return;
+  try {
+    const found = await invoke<string | null>("find_game");
+    if (found) {
+      config = { ...config, gamePath: found };
+      draftPath = found;
+      cfgGameText.textContent = shortPath(found);
+      saveConfig(config);
+      flashStatus("ok", "Jeu détecté");
+    }
+  } catch {
+    // ignore
+  }
+}
 
 async function boot() {
   setBoot(8);
@@ -449,7 +492,10 @@ async function boot() {
     // Pas de serveur MAJ / hors ligne : on continue
   }
 
-  setBoot(Math.max(pct, 70));
+  setBoot(Math.max(pct, 62));
+  await autoDetectGame();
+
+  setBoot(Math.max(pct, 78));
   try {
     const st = await invoke<StubStatus>("get_status");
     stubOnline = st.running;
@@ -461,7 +507,7 @@ async function boot() {
   setBoot(100);
   await new Promise((r) => setTimeout(r, 320));
   finishBoot();
-  if (stubOnline) setStatus("ok", "En ligne");
+  if (stubOnline) setStatus("ok", `En ligne — ${config.lobbyName}`);
 }
 
 setInterval(() => {
