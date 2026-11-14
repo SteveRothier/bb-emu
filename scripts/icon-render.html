@@ -1,0 +1,72 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Luckiest+Guy&family=Oswald:wght@700&display=swap" rel="stylesheet" />
+    <style>
+      * { margin: 0; padding: 0; }
+      html, body { width: 1024px; height: 1024px; overflow: hidden; background: #12110f; }
+      canvas { display: block; width: 1024px; height: 1024px; }
+    </style>
+  </head>
+  <body>
+    <canvas id="c" width="1024" height="1024"></canvas>
+    <script>
+      async function draw() {
+        await document.fonts.load('700 120px Oswald');
+        await document.fonts.load('400 100px "Luckiest Guy"');
+        await document.fonts.ready;
+
+        const c = document.getElementById("c");
+        const ctx = c.getContext("2d");
+        const W = 1024;
+        const barH = 210;
+        const topH = W - barH;
+
+        ctx.fillStyle = "#12110f";
+        ctx.fillRect(0, 0, W, topH);
+        ctx.fillStyle = "#c42a22";
+        ctx.fillRect(0, topH, W, barH);
+
+        ctx.fillStyle = "#f2ebe3";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "alphabetic";
+
+        // Un peu plus grand (~76% largeur) + léger écart entre les B
+        let size = 640;
+        ctx.font = `400 ${size}px "Luckiest Guy"`;
+        ctx.letterSpacing = "0px";
+        let m = ctx.measureText("BB");
+        const maxW = W * 0.76;
+        if (m.width > 0) size = Math.floor(size * (maxW / m.width));
+        size = Math.min(size, Math.floor(topH * 0.64));
+        ctx.font = `400 ${size}px "Luckiest Guy"`;
+        const gap = Math.round(size * 0.06);
+        ctx.letterSpacing = `${gap}px`;
+        m = ctx.measureText("BB");
+        if (m.width > maxW) {
+          size = Math.floor(size * (maxW / m.width));
+          ctx.font = `400 ${size}px "Luckiest Guy"`;
+          ctx.letterSpacing = `${Math.round(size * 0.06)}px`;
+          m = ctx.measureText("BB");
+        }
+
+        // Centrage optique dans la zone noire
+        const ascent = m.actualBoundingBoxAscent ?? size * 0.75;
+        const descent = m.actualBoundingBoxDescent ?? size * 0.15;
+        const glyphH = ascent + descent;
+        const y = topH / 2 - glyphH / 2 + ascent + topH * 0.03;
+
+        ctx.fillText("BB", W / 2, y);
+
+        ctx.font = `700 110px Oswald`;
+        ctx.textBaseline = "middle";
+        ctx.fillText("EMU", W / 2, topH + barH / 2);
+        document.title = "ready";
+      }
+      draw();
+    </script>
+  </body>
+</html>
