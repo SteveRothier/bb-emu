@@ -1,0 +1,11 @@
+node_modules
+dist
+src-tauri/target
+src-tauri/keys/*.key
+!src-tauri/keys/*.key.pub
+.DS_Store
+*.log
+latest.json
+*.exe
+*.msi
+*.sig

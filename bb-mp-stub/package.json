@@ -1,0 +1,11 @@
+{
+  "name": "bb-mp-stub",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Blitz Brigade UDPPacket local MP stub (port 7891)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node selftest.js"
+  }
+}

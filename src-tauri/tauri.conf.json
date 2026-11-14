@@ -1,0 +1,65 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "BB EMU",
+  "version": "0.1.1",
+  "identifier": "com.bbemu.launcher",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "BB EMU",
+        "width": 1100,
+        "height": 680,
+        "minWidth": 900,
+        "minHeight": 560,
+        "resizable": true,
+        "fullscreen": false,
+        "decorations": false,
+        "transparent": false,
+        "shadow": true,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "createUpdaterArtifacts": true,
+    "targets": ["nsis", "msi"],
+    "resources": {
+      "../bb-mp-stub/server.js": "bb-mp-stub/server.js",
+      "../bb-mp-stub/packet.js": "bb-mp-stub/packet.js",
+      "../bb-mp-stub/package.json": "bb-mp-stub/package.json"
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDhBRDUxRjM0M0U2NThBMkUKUldRdWltVStOQi9WaXF2VmpHWGQ0emxrSmRuMXhibVBpQWVINFNlMGMyb1VMWUJubDZUMXU1TGQK",
+      "endpoints": [
+        "https://github.com/SteveRothier/bb-emu/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

@@ -1,0 +1,653 @@
+:root {
+  --bg: #12110f;
+  --blood: #9a1f1a;
+  --blood-hot: #c42a22;
+  --sand: #d6c4a8;
+  --fog: #a89a88;
+  --steel: #8a8680;
+  --ok: #6a8f5a;
+  --err: #c42a22;
+  --font-display: "Oswald", sans-serif;
+  --font-body: "IBM Plex Sans Condensed", sans-serif;
+  --font-game: "Luckiest Guy", cursive;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#app {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--sand);
+  font-family: var(--font-body);
+  font-weight: 400;
+  user-select: none;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* —— Chrome (style normal) —— */
+.titlebar {
+  height: 36px;
+  display: flex;
+  align-items: stretch;
+  background: transparent;
+  border: 0;
+  flex-shrink: 0;
+  z-index: 20;
+  position: relative;
+}
+
+.titlebar-drag {
+  flex: 1;
+  app-region: drag;
+  -webkit-app-region: drag;
+}
+
+.titlebar-controls {
+  display: flex;
+  app-region: no-drag;
+  -webkit-app-region: no-drag;
+}
+
+.win-btn {
+  width: 46px;
+  height: 36px;
+  border: 0;
+  background: transparent;
+  color: var(--fog);
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.win-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--sand);
+}
+
+.win-btn.close:hover {
+  background: var(--blood);
+  color: #fff;
+}
+
+.win-btn svg {
+  width: 14px;
+  height: 14px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.75;
+  pointer-events: none;
+}
+
+/* —— Shell —— */
+.shell {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background:
+    linear-gradient(90deg, rgba(10, 9, 8, 0.55) 0%, rgba(10, 9, 8, 0.25) 42%, transparent 72%),
+    url("/wallpaper.jpg") right center / cover no-repeat;
+}
+
+.stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(280px, 42%) 1fr;
+}
+
+.panel {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 28px 36px 28px;
+  background: transparent;
+}
+
+.art-space {
+  position: relative;
+  z-index: 0;
+}
+
+.brand-block {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.brand-bb {
+  font-family: var(--font-display);
+  font-size: clamp(4rem, 9vw, 5.5rem);
+  font-weight: 700;
+  line-height: 0.85;
+  letter-spacing: 0.02em;
+  color: #f0e6d8;
+  text-transform: uppercase;
+  text-shadow: 0 1px 10px rgba(0, 0, 0, 0.45);
+}
+
+.brand-emu {
+  font-family: var(--font-display);
+  font-size: 1.15rem;
+  font-weight: 600;
+  letter-spacing: 0.2em;
+  color: #1a100c;
+  background: var(--blood);
+  padding: 0.28rem 0.55rem 0.18rem;
+  align-self: center;
+}
+
+.dock {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 14px;
+}
+
+.update-panel {
+  width: min(280px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.update-panel[hidden] {
+  display: none;
+}
+
+.update-info {
+  font-family: var(--font-display);
+  font-weight: 500;
+  font-size: 0.95rem;
+  line-height: 1.35;
+  color: #f2ebe3;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  text-shadow: 0 1px 8px rgba(0, 0, 0, 0.7);
+  max-width: 40ch;
+}
+
+.update-bar {
+  height: 6px;
+  width: 100%;
+  background: rgba(0, 0, 0, 0.45);
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  overflow: hidden;
+}
+
+.update-bar[hidden] {
+  display: none;
+}
+
+.update-bar-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--blood-hot, #c42a22);
+  transition: width 0.12s linear;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+}
+
+.bb-btn {
+  appearance: none;
+  position: relative;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+  padding: 0.55rem 1.4rem 0.45rem;
+  font-family: var(--font-game);
+  font-size: 1.55rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  line-height: 1;
+  border-style: solid;
+  transition: filter 0.12s ease, transform 0.1s ease;
+}
+
+.bb-btn span {
+  position: relative;
+  z-index: 1;
+  pointer-events: none;
+}
+
+.bb-btn:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+/* Duo = image jeu inversée : PLAY rect gauche + menu trapèze droite */
+.bb-duo {
+  --duo-fill: #c42a22;
+  --duo-fill-deep: #9a1a14;
+  --duo-ink: #2a0808;
+  --duo-line: #6e1210;
+  --duo-hi: #e0453a;
+  display: inline-flex;
+  align-items: stretch;
+  gap: 0;
+  height: 58px;
+  filter: drop-shadow(0 3px 0 var(--duo-ink)) drop-shadow(0 5px 8px rgba(0, 0, 0, 0.35));
+}
+
+.bb-duo-play,
+.bb-duo-config {
+  height: 100%;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  color: #fff;
+  font-family: var(--font-display);
+  font-weight: 700;
+}
+
+.bb-duo-play {
+  order: 1;
+  padding: 0 1.75rem;
+  font-size: 1.7rem;
+  letter-spacing: 0.06em;
+  /* rectangle : bordure 3D type jeu */
+  border: 3px solid var(--duo-ink);
+  border-right-width: 0;
+  background:
+    repeating-linear-gradient(
+      0deg,
+      transparent 0 2px,
+      rgba(255, 255, 255, 0.08) 2px 3px
+    ),
+    repeating-linear-gradient(
+      90deg,
+      transparent 0 2px,
+      rgba(255, 255, 255, 0.06) 2px 3px
+    ),
+    linear-gradient(180deg, var(--duo-hi) 0%, var(--duo-fill) 45%, var(--duo-fill-deep) 100%);
+  box-shadow:
+    inset 0 2px 0 rgba(255, 255, 255, 0.28),
+    inset 0 -2px 0 rgba(0, 0, 0, 0.18);
+}
+
+.bb-duo-play span {
+  position: relative;
+  z-index: 1;
+  -webkit-text-stroke: 3.5px var(--duo-ink);
+  paint-order: stroke fill;
+  text-shadow: 0 2px 0 rgba(40, 0, 0, 0.5);
+}
+
+.bb-duo-config {
+  --trap: polygon(0% 0%, 95% 0%, 100% 100%, 0% 100%);
+  order: 2;
+  width: 58px;
+  min-width: 58px;
+  padding: 0 1.05rem 0 0.35rem;
+  border: 0;
+  border-left: 3px solid var(--duo-line);
+  background: var(--duo-ink);
+  box-shadow: none;
+  clip-path: var(--trap);
+}
+
+.bb-duo-config::before {
+  content: none;
+}
+
+.bb-duo-config::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  right: 4px;
+  bottom: 3px;
+  left: 0;
+  z-index: 0;
+  background:
+    repeating-linear-gradient(
+      0deg,
+      transparent 0 2px,
+      rgba(255, 255, 255, 0.08) 2px 3px
+    ),
+    linear-gradient(180deg, var(--duo-hi) 0%, var(--duo-fill) 45%, var(--duo-fill-deep) 100%);
+  box-shadow: inset 0 2px 0 rgba(255, 255, 255, 0.28);
+  clip-path: var(--trap);
+}
+
+.bb-duo-config span {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  color: #fff;
+}
+
+.bb-duo-config svg {
+  width: 24px;
+  height: 24px;
+  stroke: #fff;
+  fill: none;
+  stroke-width: 2;
+  /* contour sombre léger façon texte PLAY */
+  filter:
+    drop-shadow(1px 0 0 var(--duo-ink))
+    drop-shadow(-1px 0 0 var(--duo-ink))
+    drop-shadow(0 1px 0 var(--duo-ink))
+    drop-shadow(0 -1px 0 var(--duo-ink))
+    drop-shadow(0 1px 0 rgba(40, 0, 0, 0.35));
+}
+
+.bb-duo-play:not(:disabled):hover {
+  background:
+    repeating-linear-gradient(
+      0deg,
+      transparent 0 2px,
+      rgba(255, 255, 255, 0.08) 2px 3px
+    ),
+    linear-gradient(180deg, #f05548 0%, #e03830 45%, #c42a22 100%);
+}
+
+.bb-duo-config:hover::after {
+  background:
+    repeating-linear-gradient(
+      0deg,
+      transparent 0 2px,
+      rgba(255, 255, 255, 0.08) 2px 3px
+    ),
+    linear-gradient(180deg, #f05548 0%, #e03830 45%, #c42a22 100%);
+}
+
+.bb-duo-play:not(:disabled):active {
+  background:
+    repeating-linear-gradient(
+      0deg,
+      transparent 0 2px,
+      rgba(255, 255, 255, 0.06) 2px 3px
+    ),
+    linear-gradient(180deg, #c42a22 0%, #9a1a14 55%, #7a1210 100%);
+}
+
+.bb-duo-config:active::after {
+  background:
+    repeating-linear-gradient(
+      0deg,
+      transparent 0 2px,
+      rgba(255, 255, 255, 0.06) 2px 3px
+    ),
+    linear-gradient(180deg, #c42a22 0%, #9a1a14 55%, #7a1210 100%);
+}
+
+/* OK / Annuler — tan uni, tilt 5% bord droit */
+.bb-tan {
+  --tan-trap: polygon(0% 0%, 98% 0%, 100% 100%, 0% 100%);
+  color: #1a1a1a;
+  border: 0;
+  border-radius: 0;
+  font-family: var(--font-display);
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  background: #fff;
+  box-shadow: none;
+  text-shadow: none;
+  clip-path: var(--tan-trap);
+}
+
+.bb-tan::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  right: 4px;
+  bottom: 3px;
+  left: 3px;
+  z-index: 0;
+  background: #d6c4a8;
+  clip-path: var(--tan-trap);
+  box-shadow: none;
+  pointer-events: none;
+}
+
+.bb-tan span {
+  position: relative;
+  z-index: 1;
+}
+
+.bb-tan:hover::after {
+  background: #e4d4b8;
+}
+
+.bb-tan:active::after {
+  background: #cbb896;
+}
+
+.bb-sm {
+  font-size: 1.15rem;
+  padding: 0.55rem 1.15rem 0.45rem;
+}
+
+.status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-display);
+  font-weight: 500;
+  font-size: 0.95rem;
+  color: #f2ebe3;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  text-shadow: 0 1px 8px rgba(0, 0, 0, 0.7);
+}
+
+.update-check-btn {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+  font-family: var(--font-display);
+  font-weight: 500;
+  font-size: 0.78rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: rgba(242, 235, 227, 0.72);
+  text-shadow: 0 1px 6px rgba(0, 0, 0, 0.65);
+}
+
+.update-check-btn:hover {
+  color: #f2ebe3;
+}
+
+.status-icon {
+  display: grid;
+  place-items: center;
+  color: #f2ebe3;
+  flex-shrink: 0;
+  filter: drop-shadow(0 1px 4px rgba(0, 0, 0, 0.7));
+}
+
+.status-icon svg {
+  width: 16px;
+  height: 16px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2.25;
+}
+
+.status-icon.ok {
+  color: #8fcf7a;
+}
+
+.status-icon.err {
+  color: #e86860;
+}
+
+.status-icon.busy {
+  color: #e0c06a;
+}
+
+/* —— Config : bandes tan (pas de panneau) —— */
+.config {
+  --cfg-trap: polygon(0% 0%, 98% 0%, 100% 100%, 0% 100%);
+  position: absolute;
+  right: 24px;
+  bottom: 28px;
+  left: auto;
+  top: auto;
+  width: min(300px, calc(100% - 48px));
+  z-index: 10;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  transform: translateX(120%);
+  opacity: 0;
+  pointer-events: none;
+  transition: transform 0.22s ease, opacity 0.18s ease;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.config.open {
+  transform: none;
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.cfg-band {
+  --tan-trap: var(--cfg-trap);
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 48px;
+  padding: 0 18px 0 16px;
+  background: transparent;
+  cursor: text;
+}
+
+/* décor seul : clip ne coupe plus les clics */
+.cfg-band::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  background: #fff;
+  clip-path: var(--cfg-trap);
+  pointer-events: none;
+}
+
+.cfg-band::after {
+  content: "";
+  position: absolute;
+  inset: 3px 4px 3px 3px;
+  z-index: 0;
+  background: #d6c4a8;
+  clip-path: var(--cfg-trap);
+  pointer-events: none;
+}
+
+.cfg-band-label {
+  position: relative;
+  z-index: 1;
+  flex-shrink: 0;
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 0.95rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: #1a1a1a;
+}
+
+.cfg-band input {
+  position: relative;
+  z-index: 1;
+  flex: 1;
+  min-width: 0;
+  align-self: stretch;
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 1.15rem;
+  letter-spacing: 0.04em;
+  text-align: right;
+  padding: 0.35rem 4px 0.35rem 0;
+  border: 0;
+  background: transparent;
+  color: #1a1a1a;
+  outline: none;
+  border-radius: 0;
+  appearance: textfield;
+}
+
+.cfg-band input::-webkit-outer-spin-button,
+.cfg-band input::-webkit-inner-spin-button {
+  appearance: none;
+  margin: 0;
+}
+
+.cfg-band input:focus {
+  color: #5c1010;
+}
+
+.cfg-band-path {
+  cursor: pointer;
+}
+
+.cfg-path-btn {
+  position: relative;
+  z-index: 1;
+  flex: 1;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  padding: 0.35rem 0;
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 0.95rem;
+  letter-spacing: 0.02em;
+  color: #1a1a1a;
+  text-align: right;
+}
+
+.cfg-path-btn span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.cfg-path-btn svg {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2;
+}
+
+.config-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 2px;
+}
+
+.config-actions .bb-btn {
+  flex: 1;
+}
