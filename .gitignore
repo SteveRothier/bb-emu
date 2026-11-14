@@ -9,3 +9,5 @@ latest.json
 *.exe
 *.msi
 *.sig
+
+app-icon-source.*

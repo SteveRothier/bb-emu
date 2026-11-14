@@ -111,7 +111,7 @@ body,
   display: flex;
   flex-direction: column;
   justify-content: space-between;
-  padding: 28px 36px 28px;
+  padding: 28px 36px 56px;
   background: transparent;
 }
 
@@ -149,59 +149,106 @@ body,
 }
 
 .dock {
-  display: flex;
+  display: inline-flex;
   flex-direction: column;
-  align-items: flex-start;
-  gap: 14px;
+  align-items: stretch;
+  gap: 12px;
+  width: max-content;
+  min-width: 220px;
+  max-width: 100%;
 }
 
-.update-panel {
-  width: min(280px, 100%);
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+.dock > * {
+  margin-left: 0;
+  margin-right: 0;
+  padding-left: 0;
+  align-self: stretch;
 }
 
-.update-panel[hidden] {
-  display: none;
-}
-
-.update-info {
-  font-family: var(--font-display);
-  font-weight: 500;
-  font-size: 0.95rem;
-  line-height: 1.35;
-  color: #f2ebe3;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  text-shadow: 0 1px 8px rgba(0, 0, 0, 0.7);
-  max-width: 40ch;
-}
-
-.update-bar {
-  height: 6px;
+/* Réserve la place sous PLAY/config → pas de décalage */
+.dock-slot {
+  position: relative;
   width: 100%;
-  background: rgba(0, 0, 0, 0.45);
-  border: 1px solid rgba(255, 255, 255, 0.35);
-  overflow: hidden;
+  height: 22px;
+  flex: 0 0 22px;
+  box-sizing: border-box;
 }
 
-.update-bar[hidden] {
+.boot-panel {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  box-sizing: border-box;
+}
+
+.boot-panel[hidden] {
   display: none;
 }
 
-.update-bar-fill {
+.boot-tag {
+  flex: 0 0 auto;
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 0.78rem;
+  line-height: 1;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: #f2ebe3;
+  text-shadow: 0 1px 8px rgba(0, 0, 0, 0.7);
+  white-space: nowrap;
+}
+
+.boot-bar {
+  --boot-tilt: polygon(0% 0%, 95% 0%, 100% 100%, 0% 100%);
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 8px;
+  border-radius: 0;
+  border: 0;
+  overflow: hidden;
+  clip-path: var(--boot-tilt);
+  background-color: #3a0e0c;
+  background-image:
+    linear-gradient(rgba(0, 0, 0, 0.35) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 0, 0, 0.35) 1px, transparent 1px);
+  background-size: 4px 4px;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.55);
+}
+
+.boot-bar-fill {
+  position: relative;
   height: 100%;
   width: 0%;
-  background: var(--blood-hot, #c42a22);
-  transition: width 0.12s linear;
+  border-radius: 0;
+  background: linear-gradient(180deg, #e0352c 0%, #c42a22 55%, #9a1a14 100%);
+  transition: width 0.14s linear;
+}
+
+.boot-bar-fill::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 2px;
+  height: 100%;
+  background: #ff5a4e;
+  pointer-events: none;
 }
 
 .actions {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
-  gap: 14px;
+  gap: 0;
+  width: max-content;
+  margin: 0;
+  padding: 0;
 }
 
 .bb-btn {
@@ -439,35 +486,29 @@ body,
 }
 
 .status {
+  position: absolute;
+  inset: 0;
   display: flex;
   align-items: center;
+  justify-content: flex-start;
   gap: 8px;
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
   font-family: var(--font-display);
   font-weight: 500;
   font-size: 0.95rem;
   color: #f2ebe3;
   letter-spacing: 0.08em;
   text-transform: uppercase;
+  text-align: left;
   text-shadow: 0 1px 8px rgba(0, 0, 0, 0.7);
 }
 
-.update-check-btn {
-  appearance: none;
-  border: 0;
-  background: transparent;
-  padding: 0;
-  cursor: pointer;
-  font-family: var(--font-display);
-  font-weight: 500;
-  font-size: 0.78rem;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: rgba(242, 235, 227, 0.72);
-  text-shadow: 0 1px 6px rgba(0, 0, 0, 0.65);
-}
-
-.update-check-btn:hover {
-  color: #f2ebe3;
+.status[hidden] {
+  display: none;
 }
 
 .status-icon {

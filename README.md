@@ -14,9 +14,7 @@ Prérequis : Node.js, Rust, WebView2.
 ## Build / release
 
 1. Monte la `version` dans `src-tauri/tauri.conf.json` (+ `package.json` / `Cargo.toml`)
-2. `build.bat` (signe avec `src-tauri/keys/bb-emu.key`)
-3. Crée une GitHub Release `vX.Y.Z`
-4. Uploade : setup NSIS/MSI, fichiers `.sig`, et `latest.json`
+2. `build.bat` — build, signe, génère `latest.json` et publie la GitHub Release automatiquement (`gh` requis)
 
 Endpoint updater :
 

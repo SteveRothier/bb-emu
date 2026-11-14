@@ -16,8 +16,14 @@ function findAsset(dir, pred) {
   return name ? path.join(dir, name) : null;
 }
 
-const nsis = findAsset(path.join(releaseDir, "nsis"), (f) => f.endsWith("-setup.exe"));
-const msi = findAsset(path.join(releaseDir, "msi"), (f) => f.endsWith(".msi"));
+const nsis = findAsset(
+  path.join(releaseDir, "nsis"),
+  (f) => f.includes(`_${version}_`) && f.endsWith("-setup.exe"),
+);
+const msi = findAsset(
+  path.join(releaseDir, "msi"),
+  (f) => f.includes(`_${version}_`) && f.endsWith(".msi"),
+);
 const asset = nsis || msi;
 
 if (!asset) {
@@ -34,6 +40,9 @@ if (!fs.existsSync(sigPath)) {
 
 const signature = fs.readFileSync(sigPath, "utf8").trim();
 const fileName = path.basename(asset);
+// GitHub remplace les espaces par des points dans les noms d'assets
+const fileUrlName = encodeURIComponent(fileName.replace(/ /g, "."));
+// productName BB-EMU → plus d'espaces ; garde le replace pour compat anciennes builds
 
 // Remplace cette URL par l'URL réelle de ton release GitHub (ou autre host)
 const baseUrl =
@@ -47,7 +56,7 @@ const latest = {
   platforms: {
     "windows-x86_64": {
       signature,
-      url: `${baseUrl}/${fileName}`,
+      url: `${baseUrl}/${fileUrlName}`,
     },
   },
 };

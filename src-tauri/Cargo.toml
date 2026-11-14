@@ -1,6 +1,6 @@
 [package]
 name = "bb-emu"
-version = "0.1.1"
+version = "0.1.2"
 description = "BB EMU — launcher Blitz Brigade + stub UDP local"
 authors = ["Steve"]
 edition = "2021"

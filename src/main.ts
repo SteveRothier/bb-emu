@@ -12,7 +12,6 @@ import {
   X,
   CircleCheck,
   CircleAlert,
-  CircleDot,
 } from "lucide";
 import type { IconNode } from "lucide";
 import "./styles.css";
@@ -97,26 +96,25 @@ app.innerHTML = `
 
         <div class="dock">
           <div class="actions bb-duo">
-            <button class="bb-btn bb-duo-play" id="btn-launch" type="button">
+            <button class="bb-btn bb-duo-play" id="btn-launch" type="button" disabled>
               <span id="play-label">PLAY</span>
             </button>
             <button class="bb-btn bb-duo-config" id="btn-config" type="button" aria-label="Configurer">
               <span id="ico-config"></span>
             </button>
           </div>
-          <div class="update-panel" id="update-panel" hidden>
-            <p class="update-info" id="update-info"></p>
-            <div class="update-bar" id="update-bar" hidden aria-hidden="true">
-              <div class="update-bar-fill" id="update-bar-fill"></div>
+          <div class="dock-slot">
+            <div class="boot-panel" id="boot-panel">
+              <span class="boot-tag" id="boot-tag">MAJ</span>
+              <div class="boot-bar" aria-hidden="true">
+                <div class="boot-bar-fill" id="boot-bar-fill"></div>
+              </div>
+            </div>
+            <div class="status" id="status-row" hidden>
+              <span class="status-icon" id="status-dot"></span>
+              <span id="status-text">Prêt</span>
             </div>
           </div>
-          <div class="status">
-            <span class="status-icon" id="status-dot"></span>
-            <span id="status-text">Prêt</span>
-          </div>
-          <button type="button" class="update-check-btn" id="btn-check-update">
-            Vérifier les MAJ
-          </button>
         </div>
       </section>
       <div class="art-space" aria-hidden="true"></div>
@@ -174,12 +172,11 @@ const cfgPort = document.querySelector<HTMLInputElement>("#cfg-port")!;
 const cfgLobby = document.querySelector<HTMLInputElement>("#cfg-lobby")!;
 const cfgGameBtn = document.querySelector<HTMLButtonElement>("#cfg-game-btn")!;
 const cfgGameText = document.querySelector<HTMLElement>("#cfg-game-text")!;
+const statusRow = document.querySelector<HTMLElement>("#status-row")!;
 const statusDot = document.querySelector<HTMLElement>("#status-dot")!;
 const statusText = document.querySelector<HTMLElement>("#status-text")!;
-const updatePanel = document.querySelector<HTMLElement>("#update-panel")!;
-const updateInfo = document.querySelector<HTMLElement>("#update-info")!;
-const updateBar = document.querySelector<HTMLElement>("#update-bar")!;
-const updateBarFill = document.querySelector<HTMLElement>("#update-bar-fill")!;
+const bootPanel = document.querySelector<HTMLElement>("#boot-panel")!;
+const bootBarFill = document.querySelector<HTMLElement>("#boot-bar-fill")!;
 
 document.querySelector("#win-min")!.addEventListener("click", () => win.minimize());
 document.querySelector("#win-close")!.addEventListener("click", () => win.close());
@@ -200,15 +197,41 @@ cfgLobby.addEventListener("input", () => {
   cfgLobby.value = cfgLobby.value.slice(0, LOBBY_MAX_LEN);
 });
 
+let booting = true;
+
+function setBoot(pct: number) {
+  bootPanel.hidden = false;
+  statusRow.hidden = true;
+  bootBarFill.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+  btnLaunch.disabled = true;
+}
+
+function finishBoot() {
+  booting = false;
+  bootPanel.hidden = true;
+  statusRow.hidden = true;
+  btnLaunch.disabled = busy;
+  playLabel.textContent = stubOnline ? "STOP" : "PLAY";
+}
+
 function setStatus(kind: "idle" | "ok" | "err" | "busy", message: string) {
+  if (booting) return;
+  // Idle / prêt : rien sous les boutons
+  if (kind === "idle") {
+    statusRow.hidden = true;
+    busy = false;
+    btnLaunch.disabled = false;
+    playLabel.textContent = stubOnline ? "STOP" : "PLAY";
+    return;
+  }
+  statusRow.hidden = false;
   statusDot.classList.remove("ok", "err", "busy");
   const iconMap = {
-    idle: CircleDot,
     ok: CircleCheck,
     err: CircleAlert,
     busy: LoaderCircle,
   } as const;
-  if (kind !== "idle") statusDot.classList.add(kind);
+  statusDot.classList.add(kind);
   mountIcon(statusDot, iconMap[kind], 16);
   const svg = statusDot.querySelector("svg");
   if (svg) {
@@ -267,7 +290,7 @@ cfgGameBtn.addEventListener("click", async (e) => {
       cfgGameText.textContent = shortPath(draftPath);
     }
   } catch (err) {
-    setStatus("err", err instanceof Error ? err.message : String(err));
+    flashStatus("err", shortErr(err instanceof Error ? err.message : String(err)));
   }
 });
 
@@ -281,24 +304,44 @@ btnSave.addEventListener("click", () => {
   cfgLobby.value = config.lobbyName;
   cfgGameText.textContent = shortPath(config.gamePath);
   saveConfig(config);
-  setStatus(stubOnline ? "ok" : "idle", stubOnline ? "En ligne" : "Config enregistrée");
   openConfig(false);
+  if (stubOnline) setStatus("ok", "En ligne");
+  else flashStatus("ok", "Config enregistrée");
 });
+
+let statusClearTimer = 0;
+
+function flashStatus(kind: "ok" | "err", message: string, ms = 2200) {
+  setStatus(kind, message);
+  window.clearTimeout(statusClearTimer);
+  statusClearTimer = window.setTimeout(() => {
+    if (!busy && !booting) setStatus("idle", "");
+  }, ms);
+}
 
 function shortErr(raw: string): string {
   const msg = raw.replace(/^Error:\s*/i, "").trim();
-  if (/node/i.test(msg) && /spawn|not found|ENOENT/i.test(msg)) {
-    return "Node.js introuvable";
+  if (/node/i.test(msg) && /spawn|not found|ENOENT|PATH/i.test(msg)) {
+    return "Installe Node.js puis réessaie";
   }
-  if (/introuvable|not found|ENOENT/i.test(msg) && /jeu|exe|executable/i.test(msg)) {
-    return "Jeu introuvable";
+  if (/permission|access is denied|EACCES|EPERM/i.test(msg)) {
+    return "Accès refusé — relance en admin si besoin";
   }
-  if (/stub/i.test(msg) && /introuvable|manquant/i.test(msg)) {
-    return "Stub introuvable";
+  if (/introuvable|not found|ENOENT/i.test(msg) && /jeu|exe|executable|blitz/i.test(msg)) {
+    return "Blitz Brigade introuvable — Config";
   }
-  if (/déjà/i.test(msg)) return "Déjà en ligne";
-  if (/port/i.test(msg) && /in use|EADDRINUSE/i.test(msg)) return "Port déjà utilisé";
-  return msg.length > 48 ? `${msg.slice(0, 45)}…` : msg;
+  if (/stub/i.test(msg) && /introuvable|manquant|missing/i.test(msg)) {
+    return "Stub manquant — réinstalle BB-EMU";
+  }
+  if (/déjà|already/i.test(msg)) return "Déjà en ligne";
+  if (/port/i.test(msg) && /in use|EADDRINUSE|occup/i.test(msg)) {
+    return "Port occupé — change-le dans Config";
+  }
+  if (/network|fetch|ENOTFOUND|timed out|timeout|ECONN/i.test(msg)) {
+    return "Réseau indisponible";
+  }
+  if (/signature|pubkey|updater/i.test(msg)) return "MAJ invalide ou corrompue";
+  return msg.length > 42 ? `${msg.slice(0, 39)}…` : msg;
 }
 
 async function refreshStatus() {
@@ -306,33 +349,33 @@ async function refreshStatus() {
     const st = await invoke<StubStatus>("get_status");
     stubOnline = st.running;
     if (!st.stub_ready) {
-      setStatus("err", "Stub introuvable");
+      setStatus("err", "Stub manquant — réinstalle BB-EMU");
       return;
     }
     if (st.running) setStatus("ok", "En ligne");
-    else setStatus("idle", "Arrêté");
+    else setStatus("idle", "");
   } catch (e) {
-    setStatus("err", shortErr(e instanceof Error ? e.message : String(e)));
+    flashStatus("err", shortErr(e instanceof Error ? e.message : String(e)));
   }
 }
 
 btnLaunch.addEventListener("click", async () => {
-  if (busy) return;
+  if (busy || booting) return;
 
   if (stubOnline) {
     setStatus("busy", "Arrêt…");
     try {
       await invoke<string>("stop_stub");
       stubOnline = false;
-      setStatus("idle", "Arrêté");
+      setStatus("idle", "");
     } catch (e) {
-      setStatus("err", shortErr(e instanceof Error ? e.message : String(e)));
+      flashStatus("err", shortErr(e instanceof Error ? e.message : String(e)));
     }
     return;
   }
 
   if (!config.gamePath) {
-    setStatus("err", "Choisis le jeu dans Config");
+    flashStatus("err", "Choisis le jeu dans Config");
     openConfig(true);
     return;
   }
@@ -346,106 +389,83 @@ btnLaunch.addEventListener("click", async () => {
     });
     stubOnline = true;
     if (msg.includes("En ligne")) setStatus("ok", "En ligne");
-    else if (/échec|introuvable/i.test(msg)) setStatus("err", shortErr(msg));
-    else setStatus("ok", shortErr(msg));
+    else if (/échec|introuvable/i.test(msg)) flashStatus("err", shortErr(msg));
+    else setStatus("ok", shortErr(msg) || "En ligne");
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     if (msg.includes("déjà")) {
       stubOnline = true;
       setStatus("ok", "En ligne");
     } else {
-      setStatus("err", shortErr(msg));
+      flashStatus("err", shortErr(msg));
     }
   }
 });
 
-function hideUpdatePanel() {
-  updatePanel.hidden = true;
-  updateBar.hidden = true;
-  updateBar.setAttribute("aria-hidden", "true");
-  updateBarFill.style.width = "0%";
-  updateInfo.textContent = "";
-}
+async function boot() {
+  setBoot(8);
 
-function setUpdateProgress(pct: number) {
-  updateBar.hidden = false;
-  updateBar.setAttribute("aria-hidden", "false");
-  updateBarFill.style.width = `${Math.max(0, Math.min(100, pct))}%`;
-}
+  let pct = 8;
+  const tick = window.setInterval(() => {
+    if (!booting || pct >= 55) return;
+    pct += 3;
+    bootBarFill.style.width = `${pct}%`;
+  }, 120);
 
-async function runUpdater(manual = false) {
-  updatePanel.hidden = false;
-  updateBar.hidden = true;
-  updateBar.setAttribute("aria-hidden", "true");
-  updateBarFill.style.width = "0%";
-  updateInfo.textContent = "Recherche de mises à jour…";
-
+  setBoot(Math.max(pct, 18));
   try {
     const update = await check();
-    if (!update) {
-      if (manual) {
-        updateInfo.textContent = "Déjà à jour";
-        window.setTimeout(() => hideUpdatePanel(), 1800);
-      } else {
-        hideUpdatePanel();
-      }
+    if (update) {
+      setBoot(30);
+      let downloaded = 0;
+      let total = 0;
+      await update.downloadAndInstall((event) => {
+        switch (event.event) {
+          case "Started":
+            total = event.data.contentLength ?? 0;
+            downloaded = 0;
+            setBoot(35);
+            break;
+          case "Progress":
+            downloaded += event.data.chunkLength;
+            if (total > 0) {
+              setBoot(35 + Math.round((downloaded / total) * 55));
+            } else {
+              pct = Math.min(88, pct + 2);
+              setBoot(pct);
+            }
+            break;
+          case "Finished":
+            setBoot(95);
+            break;
+        }
+      });
+      window.clearInterval(tick);
+      setBoot(100);
+      await relaunch();
       return;
     }
-
-    const notes = (update.body || "").trim();
-    updateInfo.textContent = notes
-      ? `Mise à jour ${update.version} — ${notes}`
-      : `Mise à jour ${update.version} disponible`;
-
-    let downloaded = 0;
-    let total = 0;
-
-    await update.downloadAndInstall((event) => {
-      switch (event.event) {
-        case "Started":
-          total = event.data.contentLength ?? 0;
-          downloaded = 0;
-          updateInfo.textContent = `Téléchargement ${update.version}…`;
-          setUpdateProgress(total ? 0 : 8);
-          break;
-        case "Progress":
-          downloaded += event.data.chunkLength;
-          if (total > 0) {
-            const pct = Math.round((downloaded / total) * 100);
-            setUpdateProgress(pct);
-            updateInfo.textContent = `Téléchargement ${update.version} — ${pct}%`;
-          } else {
-            setUpdateProgress(Math.min(90, (Number.parseFloat(updateBarFill.style.width) || 0) + 4));
-          }
-          break;
-        case "Finished":
-          setUpdateProgress(100);
-          updateInfo.textContent = "Installation…";
-          break;
-      }
-    });
-
-    updateInfo.textContent = "Redémarrage…";
-    await relaunch();
-  } catch (e) {
-    if (manual) {
-      updatePanel.hidden = false;
-      updateBar.hidden = true;
-      updateInfo.textContent = shortErr(e instanceof Error ? e.message : String(e));
-      window.setTimeout(() => hideUpdatePanel(), 2800);
-    } else {
-      hideUpdatePanel();
-    }
+  } catch {
+    // Pas de serveur MAJ / hors ligne : on continue
   }
+
+  setBoot(Math.max(pct, 70));
+  try {
+    const st = await invoke<StubStatus>("get_status");
+    stubOnline = st.running;
+  } catch {
+    // ignore
+  }
+
+  window.clearInterval(tick);
+  setBoot(100);
+  await new Promise((r) => setTimeout(r, 320));
+  finishBoot();
+  if (stubOnline) setStatus("ok", "En ligne");
 }
 
-document.querySelector("#btn-check-update")!.addEventListener("click", () => {
-  void runUpdater(true);
-});
-
-refreshStatus();
 setInterval(() => {
-  if (!busy) refreshStatus();
+  if (!busy && !booting) refreshStatus();
 }, 3000);
 
-void runUpdater(false);
+void boot();
