@@ -1,7 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { open } from "@tauri-apps/plugin-dialog";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import {
@@ -83,8 +82,13 @@ function saveConfig(cfg: Config) {
   localStorage.setItem("bb-emu-config", JSON.stringify(cfg));
 }
 
+function isStorePath(p: string): boolean {
+  const s = p.toLowerCase();
+  return s.includes("windowsapps") && (s.includes("gameloftsa.blitzbrigade") || s.includes("infamousheroesentry.exe"));
+}
+
 function shortPath(p: string): string {
-  if (!p) return "Choisir BlitzBrigade.exe…";
+  if (!p || isStorePath(p)) return "Blitz Brigade (Store)";
   const parts = p.replace(/\//g, "\\").split("\\");
   if (parts.length <= 2) return p;
   return `…\\${parts.slice(-2).join("\\")}`;
@@ -145,11 +149,14 @@ app.innerHTML = `
         </label>
         <div class="cfg-band cfg-band-path">
           <span class="cfg-band-label">Jeu</span>
-          <button type="button" class="cfg-path-btn" id="cfg-game-btn" title="Choisir l'exécutable">
+          <button type="button" class="cfg-path-btn" id="cfg-game-btn" title="Jeu Microsoft Store">
             <span id="cfg-game-text"></span>
             <span id="ico-folder"></span>
           </button>
         </div>
+        <button class="bb-btn bb-tan bb-sm cfg-store-btn" id="btn-store" type="button" hidden>
+          <span>Installer le jeu (Store)</span>
+        </button>
         <div class="config-actions">
           <button class="bb-btn bb-tan bb-sm" id="btn-save" type="button">
             <span>OK</span>
@@ -188,6 +195,7 @@ const cfgPort = document.querySelector<HTMLInputElement>("#cfg-port")!;
 const cfgLobby = document.querySelector<HTMLInputElement>("#cfg-lobby")!;
 const cfgGameBtn = document.querySelector<HTMLButtonElement>("#cfg-game-btn")!;
 const cfgGameText = document.querySelector<HTMLElement>("#cfg-game-text")!;
+const btnStore = document.querySelector<HTMLButtonElement>("#btn-store")!;
 const statusRow = document.querySelector<HTMLElement>("#status-row")!;
 const statusDot = document.querySelector<HTMLElement>("#status-dot")!;
 const statusText = document.querySelector<HTMLElement>("#status-text")!;
@@ -224,19 +232,34 @@ cfgLobby.addEventListener("input", () => {
 
 let booting = true;
 
+function hasGameInstalled() {
+  return true;
+}
+
+function syncPlayBtn() {
+  playLabel.textContent = stubOnline ? "STOP" : "PLAY";
+  // STOP toujours possible ; PLAY seulement si le jeu est installé
+  const blockPlay = !stubOnline && !hasGameInstalled();
+  btnLaunch.disabled = booting || busy || blockPlay;
+  btnLaunch.title = blockPlay
+    ? "Installe le jeu pour lancer"
+    : stubOnline
+      ? "Arrêter"
+      : "Lancer";
+}
+
 function setBoot(pct: number) {
   bootPanel.hidden = false;
   statusRow.hidden = true;
   bootBarFill.style.width = `${Math.max(0, Math.min(100, pct))}%`;
-  btnLaunch.disabled = true;
+  syncPlayBtn();
 }
 
 function finishBoot() {
   booting = false;
   bootPanel.hidden = true;
   statusRow.hidden = true;
-  btnLaunch.disabled = busy;
-  playLabel.textContent = stubOnline ? "STOP" : "PLAY";
+  syncPlayBtn();
 }
 
 function setStatus(kind: "idle" | "ok" | "err" | "busy", message: string) {
@@ -245,8 +268,7 @@ function setStatus(kind: "idle" | "ok" | "err" | "busy", message: string) {
   if (kind === "idle") {
     statusRow.hidden = true;
     busy = false;
-    btnLaunch.disabled = false;
-    playLabel.textContent = stubOnline ? "STOP" : "PLAY";
+    syncPlayBtn();
     return;
   }
   statusRow.hidden = false;
@@ -266,12 +288,17 @@ function setStatus(kind: "idle" | "ok" | "err" | "busy", message: string) {
   }
   statusText.textContent = message;
   busy = kind === "busy";
-  btnLaunch.disabled = busy;
-  playLabel.textContent = stubOnline ? "STOP" : "PLAY";
+  syncPlayBtn();
 }
 
 function isConfigOpen() {
   return configEl.classList.contains("open");
+}
+
+function syncStoreBtn() {
+  const missing = !hasGameInstalled();
+  btnStore.hidden = !missing;
+  syncPlayBtn();
 }
 
 function openConfig(open: boolean) {
@@ -280,6 +307,8 @@ function openConfig(open: boolean) {
     cfgLobby.value = config.lobbyName;
     draftPath = config.gamePath;
     cfgGameText.textContent = shortPath(draftPath);
+    syncStoreBtn();
+    void autoDetectGame();
   }
   configEl.classList.toggle("open", open);
   configEl.setAttribute("aria-hidden", open ? "false" : "true");
@@ -303,17 +332,36 @@ document.addEventListener("pointerdown", (e) => {
 cfgGameBtn.addEventListener("click", async (e) => {
   e.preventDefault();
   e.stopPropagation();
-  try {
-    const selected = await open({
-      multiple: false,
-      directory: false,
-      filters: [{ name: "Exécutable", extensions: ["exe"] }],
-      title: "Choisir Blitz Brigade",
-    });
-    if (typeof selected === "string" && selected) {
-      draftPath = selected;
-      cfgGameText.textContent = shortPath(draftPath);
+  const path = draftPath || config.gamePath;
+  if (path && !isStorePath(path)) {
+    try {
+      await invoke("reveal_game_path", { path });
+    } catch (err) {
+      flashStatus("err", shortErr(err instanceof Error ? err.message : String(err)));
     }
+    return;
+  }
+  try {
+    const found = await invoke<string | null>("find_game", { preferred: path || null });
+    if (found) {
+      draftPath = found;
+      cfgGameText.textContent = shortPath(draftPath);
+      syncStoreBtn();
+    } else {
+      draftPath = "";
+      cfgGameText.textContent = shortPath("");
+    }
+  } catch (err) {
+    flashStatus("err", shortErr(err instanceof Error ? err.message : String(err)));
+  }
+});
+
+btnStore.addEventListener("click", async (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  try {
+    await invoke("open_game_store");
+    flashStatus("ok", "Store ouvert — reviens après l’install");
   } catch (err) {
     flashStatus("err", shortErr(err instanceof Error ? err.message : String(err)));
   }
@@ -331,6 +379,7 @@ btnSave.addEventListener("click", () => {
   cfgLobby.value = config.lobbyName;
   cfgGameText.textContent = shortPath(config.gamePath);
   saveConfig(config);
+  syncStoreBtn();
   openConfig(false);
   if (stubOnline) setStatus("ok", `En ligne — ${config.lobbyName}`);
   else flashStatus("ok", "Config enregistrée");
@@ -401,10 +450,9 @@ btnLaunch.addEventListener("click", async () => {
     return;
   }
 
-  if (!config.gamePath) {
-    flashStatus("err", "Choisis le jeu dans Config");
-    openConfig(true);
-    return;
+  if (!config.gamePath && draftPath) {
+    config = { ...config, gamePath: draftPath };
+    saveConfig(config);
   }
 
   setStatus("busy", "Lancement…");
@@ -430,20 +478,34 @@ btnLaunch.addEventListener("click", async () => {
 });
 
 async function autoDetectGame() {
-  if (config.gamePath) return;
+  const previous = config.gamePath;
   try {
-    const found = await invoke<string | null>("find_game");
+    const found = await invoke<string | null>("find_game", {
+      preferred: previous || null,
+    });
     if (found) {
-      config = { ...config, gamePath: found };
       draftPath = found;
       cfgGameText.textContent = shortPath(found);
+      if (found !== previous) {
+        config = { ...config, gamePath: found };
+        saveConfig(config);
+        flashStatus("ok", previous ? "Chemin jeu mis à jour" : "Jeu détecté");
+      }
+    } else if (previous) {
+      config = { ...config, gamePath: "" };
+      draftPath = "";
+      cfgGameText.textContent = shortPath("");
       saveConfig(config);
-      flashStatus("ok", "Jeu détecté");
     }
   } catch {
     // ignore
   }
+  syncStoreBtn();
 }
+
+window.addEventListener("focus", () => {
+  void autoDetectGame();
+});
 
 async function boot() {
   setBoot(8);

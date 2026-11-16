@@ -701,6 +701,15 @@ body,
   stroke-width: 2;
 }
 
+.cfg-store-btn {
+  width: 100%;
+  margin-top: 2px;
+}
+
+.cfg-store-btn[hidden] {
+  display: none;
+}
+
 .config-actions {
   display: flex;
   gap: 10px;

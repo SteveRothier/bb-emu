@@ -9,7 +9,9 @@ Launcher Windows pour **Blitz Brigade** (stub UDP local inclus).
 3. Lance l’installateur (pas besoin d’admin)
 4. Ouvre **BB-EMU** → Config si besoin (`BlitzBrigade.exe`) → **PLAY**
 
-Prérequis : [Node.js](https://nodejs.org/) (stub) + WebView2 (déjà là sur Windows 10/11 récents).
+Au lancement, BB EMU cherche le jeu (Store Gameloft inclus : `WindowsApps\GAMELOFTSA.BlitzBrigade_*\InfamousHeroesEntry.exe`) et remplit le chemin automatiquement. Si rien n’est trouvé, Config propose **Installer le jeu (Store)** (ProductId `9WZDNCRFJ265`).
+
+Prérequis : [Node.js](https://nodejs.org/) (stub) + WebView2 (déjà là sur Windows 10/11 récents). + le jeu Blitz Brigade.
 
 Les mises à jour s’installent automatiquement au lancement.
 
