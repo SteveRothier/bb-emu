@@ -11,3 +11,5 @@ latest.json
 *.sig
 
 app-icon-source.*
+
+bb-mp-stub/_re_tmp/

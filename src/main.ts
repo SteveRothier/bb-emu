@@ -17,37 +17,58 @@ import type { IconNode } from "lucide";
 import "./styles.css";
 
 type Config = {
-  port: number;
-  lobbyName: string;
-  lobbies: string[];
   gamePath: string;
-};
-
-type StubStatus = {
-  running: boolean;
-  stub_ready: boolean;
-  stub_path: string | null;
+  lastLobbyName: string;
+  lastMapId: number;
+  lastGameMode: number;
 };
 
 const DEFAULT_CONFIG: Config = {
-  port: 7891,
-  lobbyName: "StubLobby",
-  lobbies: ["StubLobby", "Public", "Friends"],
   gamePath: "",
+  lastLobbyName: "MaPartie",
+  lastMapId: 0, // Cathédrale (wire)
+  lastGameMode: 0, // Domination
 };
-const PORT_MAX_LEN = 5;
-const LOBBY_MAX_LEN = 16;
-const win = getCurrentWindow();
 
-function normalizeLobbies(list: unknown, current: string): string[] {
-  const raw = Array.isArray(list) ? list.map(String) : [];
-  const cleaned = raw
-    .map((s) => s.trim().slice(0, LOBBY_MAX_LEN))
-    .filter(Boolean);
-  if (current && !cleaned.includes(current)) cleaned.unshift(current);
-  if (!cleaned.length) cleaned.push(...DEFAULT_CONFIG.lobbies);
-  return [...new Set(cleaned)].slice(0, 12);
+/**
+ * Wire 0x02 name = [gameMode, playerCount, maxPlayers, mapId] (voir levels.js).
+ * Modes : Dom=0, CTF=1, DM=2, FFA=3. Cartes : Cat=0 … OVNI=5.
+ */
+const MAP_OPTIONS = [
+  { id: 0, label: "Cathédrale" },
+  { id: 1, label: "Madagascar" },
+  { id: 2, label: "Ruines de Madagascar" },
+  { id: 3, label: "Quais de Malte" },
+  { id: 4, label: "Fort de Malte" },
+  { id: 5, label: "Crash OVNI" },
+];
+
+const MODE_OPTIONS = [
+  { id: 0, label: "Domination" },
+  { id: 1, label: "Capture de drapeau" },
+  { id: 2, label: "Match à mort" },
+  { id: 3, label: "Chacun pour soi" },
+];
+
+/** Cartes autorisées par mode (ids wire). */
+const MAPS_BY_MODE: Record<number, number[]> = {
+  0: [0, 1, 2, 4, 5],
+  1: [0, 1, 2, 3, 5],
+  2: [0, 2, 3, 4, 5],
+  3: [0, 2, 3, 5],
+};
+
+function resolveLevelIndex(modeId: number, mapId: number): number {
+  return modeId * 6 + mapId;
 }
+
+function levelLabel(modeId: number, mapId: number): string {
+  return `${labelOf(MODE_OPTIONS, modeId)} · ${labelOf(MAP_OPTIONS, mapId)}`;
+}
+
+const LOBBY_MAX_LEN = 16;
+
+const win = getCurrentWindow();
 
 function icon(node: IconNode, size = 16): SVGElement {
   const el = createElement(node);
@@ -64,17 +85,19 @@ function mountIcon(target: Element, node: IconNode, size = 16) {
 function loadConfig(): Config {
   try {
     const raw = localStorage.getItem("bb-emu-config");
-    if (!raw) return { ...DEFAULT_CONFIG, lobbies: [...DEFAULT_CONFIG.lobbies] };
+    if (!raw) return { ...DEFAULT_CONFIG };
     const parsed = JSON.parse(raw) as Partial<Config>;
-    const lobbyName = String(parsed.lobbyName || DEFAULT_CONFIG.lobbyName).slice(0, LOBBY_MAX_LEN);
     return {
-      port: Number(parsed.port) || DEFAULT_CONFIG.port,
-      lobbyName,
-      lobbies: normalizeLobbies(parsed.lobbies, lobbyName),
       gamePath: String(parsed.gamePath || ""),
+      lastLobbyName: String(parsed.lastLobbyName || DEFAULT_CONFIG.lastLobbyName).slice(
+        0,
+        LOBBY_MAX_LEN,
+      ),
+      lastMapId: Math.max(0, Math.min(255, Number(parsed.lastMapId) || 0)),
+      lastGameMode: Math.max(0, Math.min(255, Number(parsed.lastGameMode) || 0)),
     };
   } catch {
-    return { ...DEFAULT_CONFIG, lobbies: [...DEFAULT_CONFIG.lobbies] };
+    return { ...DEFAULT_CONFIG };
   }
 }
 
@@ -84,7 +107,10 @@ function saveConfig(cfg: Config) {
 
 function isStorePath(p: string): boolean {
   const s = p.toLowerCase();
-  return s.includes("windowsapps") && (s.includes("gameloftsa.blitzbrigade") || s.includes("infamousheroesentry.exe"));
+  return (
+    s.includes("windowsapps") &&
+    (s.includes("gameloftsa.blitzbrigade") || s.includes("infamousheroesentry.exe"))
+  );
 }
 
 function shortPath(p: string): string {
@@ -92,6 +118,10 @@ function shortPath(p: string): string {
   const parts = p.replace(/\//g, "\\").split("\\");
   if (parts.length <= 2) return p;
   return `…\\${parts.slice(-2).join("\\")}`;
+}
+
+function labelOf(options: { id: number; label: string }[], id: number): string {
+  return options.find((o) => o.id === id)?.label ?? String(id);
 }
 
 const app = document.querySelector("#app")!;
@@ -114,13 +144,15 @@ app.innerHTML = `
         </div>
 
         <div class="dock">
-          <div class="actions bb-duo">
-            <button class="bb-btn bb-duo-play" id="btn-launch" type="button" disabled>
-              <span id="play-label">PLAY</span>
-            </button>
-            <button class="bb-btn bb-duo-config" id="btn-config" type="button" aria-label="Configurer">
-              <span id="ico-config"></span>
-            </button>
+          <div class="actions-row">
+            <div class="actions bb-duo">
+              <button class="bb-btn bb-duo-play" id="btn-launch" type="button" disabled>
+                <span id="play-label">Lancer</span>
+              </button>
+              <button class="bb-btn bb-duo-config" id="btn-config" type="button" aria-label="Configurer">
+                <span id="ico-config"></span>
+              </button>
+            </div>
           </div>
           <div class="dock-slot">
             <div class="boot-panel" id="boot-panel">
@@ -139,14 +171,6 @@ app.innerHTML = `
       <div class="art-space" aria-hidden="true"></div>
 
       <aside class="config" id="config" aria-hidden="true">
-        <label class="cfg-band">
-          <span class="cfg-band-label">Port</span>
-          <input id="cfg-port" type="text" inputmode="numeric" maxlength="5" autocomplete="off" />
-        </label>
-        <label class="cfg-band">
-          <span class="cfg-band-label">Lobby</span>
-          <input id="cfg-lobby" type="text" maxlength="16" autocomplete="off" />
-        </label>
         <div class="cfg-band cfg-band-path">
           <span class="cfg-band-label">Jeu</span>
           <button type="button" class="cfg-path-btn" id="cfg-game-btn" title="Jeu Microsoft Store">
@@ -157,12 +181,30 @@ app.innerHTML = `
         <button class="bb-btn bb-tan bb-sm cfg-store-btn" id="btn-store" type="button" hidden>
           <span>Installer le jeu (Store)</span>
         </button>
+
+        <p class="cfg-kicker">Partie LAN</p>
+        <label class="cfg-band cfg-band-name">
+          <span class="cfg-name-head">
+            <span class="cfg-band-label">Nom</span>
+            <span class="cfg-name-count" id="cfg-name-count">0/${LOBBY_MAX_LEN}</span>
+          </span>
+          <input id="cfg-name" type="text" maxlength="${LOBBY_MAX_LEN}" autocomplete="off" spellcheck="false" />
+        </label>
+        <label class="cfg-band cfg-band-select">
+          <span class="cfg-band-label">Carte</span>
+          <select id="cfg-map" aria-label="Carte"></select>
+        </label>
+        <label class="cfg-band cfg-band-select">
+          <span class="cfg-band-label">Mode</span>
+          <select id="cfg-mode" aria-label="Mode"></select>
+        </label>
+
         <div class="config-actions">
-          <button class="bb-btn bb-tan bb-sm" id="btn-save" type="button">
-            <span>OK</span>
+          <button class="bb-btn bb-tan bb-sm" id="btn-party-toggle" type="button">
+            <span id="btn-party-toggle-label">Créer</span>
           </button>
           <button class="bb-btn bb-tan bb-sm" id="btn-close" type="button">
-            <span>Annuler</span>
+            <span>Fermer</span>
           </button>
         </div>
       </aside>
@@ -186,13 +228,15 @@ mountIcon(document.querySelector("#ico-folder")!, FolderOpen, 16);
 }
 
 const btnLaunch = document.querySelector<HTMLButtonElement>("#btn-launch")!;
-const playLabel = document.querySelector<HTMLElement>("#play-label")!;
 const btnConfig = document.querySelector<HTMLButtonElement>("#btn-config")!;
-const btnSave = document.querySelector<HTMLButtonElement>("#btn-save")!;
 const btnClose = document.querySelector<HTMLButtonElement>("#btn-close")!;
+const btnPartyToggle = document.querySelector<HTMLButtonElement>("#btn-party-toggle")!;
+const btnPartyToggleLabel = document.querySelector<HTMLElement>("#btn-party-toggle-label")!;
 const configEl = document.querySelector<HTMLElement>("#config")!;
-const cfgPort = document.querySelector<HTMLInputElement>("#cfg-port")!;
-const cfgLobby = document.querySelector<HTMLInputElement>("#cfg-lobby")!;
+const cfgName = document.querySelector<HTMLInputElement>("#cfg-name")!;
+const cfgNameCount = document.querySelector<HTMLElement>("#cfg-name-count")!;
+const cfgMap = document.querySelector<HTMLSelectElement>("#cfg-map")!;
+const cfgMode = document.querySelector<HTMLSelectElement>("#cfg-mode")!;
 const cfgGameBtn = document.querySelector<HTMLButtonElement>("#cfg-game-btn")!;
 const cfgGameText = document.querySelector<HTMLElement>("#cfg-game-text")!;
 const btnStore = document.querySelector<HTMLButtonElement>("#btn-store")!;
@@ -203,16 +247,141 @@ const bootPanel = document.querySelector<HTMLElement>("#boot-panel")!;
 const bootBarFill = document.querySelector<HTMLElement>("#boot-bar-fill")!;
 const appVersionEl = document.querySelector<HTMLElement>("#app-version")!;
 
+let partyLive = false;
+/** Dernière config poussée au stub (pour détecter un brouillon périmé). */
+let activeParty: {
+  name: string;
+  mapId: number;
+  gameMode: number;
+  levelId: number;
+} | null = null;
+
+function lobbyKey(l: {
+  name: string;
+  mapId: number;
+  gameMode: number;
+  levelId: number;
+}) {
+  return `${l.name}|${l.levelId}|${l.mapId}|${l.gameMode}`;
+}
+
+async function ensurePartyWithDraft(lobby: {
+  name: string;
+  mapId: number;
+  gameMode: number;
+  levelId: number;
+}) {
+  const same =
+    partyLive && activeParty != null && lobbyKey(activeParty) === lobbyKey(lobby);
+  if (same) return;
+
+  if (partyLive) {
+    await invoke("stop_stub");
+    partyLive = false;
+    activeParty = null;
+    syncPartyToggle();
+  }
+
+  await invoke("start_party", {
+    port: 7891,
+    lobbyName: lobby.name,
+    levelId: lobby.levelId,
+    mapId: lobby.mapId,
+    maxPlayers: 8,
+    gameMode: lobby.gameMode,
+  });
+  partyLive = true;
+  activeParty = { ...lobby };
+  syncPartyToggle();
+  await syncLobbyInjectQuiet();
+}
+
+async function syncLobbyInjectQuiet() {
+  try {
+    await invoke("sync_lobby_inject");
+  } catch {
+    // jeu pas encore patché / pas lancé — ignore
+  }
+}
+
+for (const m of MODE_OPTIONS) {
+  const opt = document.createElement("option");
+  opt.value = String(m.id);
+  opt.textContent = m.label;
+  cfgMode.append(opt);
+}
+refillMapOptions(0, 0);
+
+cfgMode.addEventListener("change", () => {
+  refillMapOptions(Number(cfgMode.value) || 0);
+});
+
+function syncNameCount() {
+  cfgNameCount.textContent = `${cfgName.value.length}/${LOBBY_MAX_LEN}`;
+}
+
+function refillMapOptions(modeId: number, preferredMapId?: number) {
+  const allowed = MAPS_BY_MODE[modeId] || MAPS_BY_MODE[0];
+  const prev = preferredMapId ?? Number(cfgMap.value);
+  cfgMap.replaceChildren();
+  for (const id of allowed) {
+    const m = MAP_OPTIONS.find((x) => x.id === id);
+    if (!m) continue;
+    const opt = document.createElement("option");
+    opt.value = String(m.id);
+    opt.textContent = m.label;
+    cfgMap.append(opt);
+  }
+  cfgMap.value = allowed.includes(prev) ? String(prev) : String(allowed[0]);
+}
+
+function fillDraftFromConfig() {
+  cfgName.value = (config.lastLobbyName || DEFAULT_CONFIG.lastLobbyName).slice(0, LOBBY_MAX_LEN);
+  const modeId = MODE_OPTIONS.some((m) => m.id === config.lastGameMode)
+    ? config.lastGameMode
+    : 0;
+  cfgMode.value = String(modeId);
+  refillMapOptions(modeId, config.lastMapId ?? 0);
+  syncNameCount();
+}
+
+function readLobbyDraft() {
+  let name = cfgName.value.trim() || "MaPartie";
+  name = [...name].slice(0, LOBBY_MAX_LEN).join("");
+  const mapId = Math.max(0, Math.min(255, Number(cfgMap.value) || 0));
+  const gameMode = Math.max(0, Math.min(255, Number(cfgMode.value) || 0));
+  const levelId = resolveLevelIndex(gameMode, mapId);
+  return { name, mapId, gameMode, levelId };
+}
+
+function syncPartyToggle() {
+  btnPartyToggle.disabled = booting || busy;
+  btnPartyToggleLabel.textContent = partyLive ? "Arrêter" : "Créer";
+  btnPartyToggle.classList.toggle("is-stop", partyLive);
+  btnPartyToggle.title = partyLive
+    ? "Arrêter la partie LAN"
+    : "Créer la partie LAN avec ces réglages";
+  btnConfig.classList.toggle("is-party-live", partyLive);
+}
+
+async function refreshPartyStatus() {
+  try {
+    const status = await invoke<{ running: boolean }>("get_status");
+    partyLive = !!status.running;
+  } catch {
+    partyLive = false;
+  }
+  if (!partyLive) activeParty = null;
+  syncPartyToggle();
+}
+
 document.querySelector("#win-min")!.addEventListener("click", () => win.minimize());
 document.querySelector("#win-close")!.addEventListener("click", () => win.close());
 
 let config = loadConfig();
 let draftPath = config.gamePath;
-let stubOnline = false;
 let busy = false;
 
-cfgPort.value = String(config.port).slice(0, PORT_MAX_LEN);
-cfgLobby.value = config.lobbyName.slice(0, LOBBY_MAX_LEN);
 cfgGameText.textContent = shortPath(draftPath);
 
 void getVersion()
@@ -223,13 +392,6 @@ void getVersion()
     appVersionEl.textContent = "v?";
   });
 
-cfgPort.addEventListener("input", () => {
-  cfgPort.value = cfgPort.value.replace(/\D/g, "").slice(0, PORT_MAX_LEN);
-});
-cfgLobby.addEventListener("input", () => {
-  cfgLobby.value = cfgLobby.value.slice(0, LOBBY_MAX_LEN);
-});
-
 let booting = true;
 
 function hasGameInstalled() {
@@ -237,15 +399,9 @@ function hasGameInstalled() {
 }
 
 function syncPlayBtn() {
-  playLabel.textContent = stubOnline ? "STOP" : "PLAY";
-  // STOP toujours possible ; PLAY seulement si le jeu est installé
-  const blockPlay = !stubOnline && !hasGameInstalled();
-  btnLaunch.disabled = booting || busy || blockPlay;
-  btnLaunch.title = blockPlay
-    ? "Installe le jeu pour lancer"
-    : stubOnline
-      ? "Arrêter"
-      : "Lancer";
+  btnLaunch.disabled = booting || busy || !hasGameInstalled();
+  btnLaunch.title = btnLaunch.disabled ? "Installe le jeu pour lancer" : "Ouvrir le jeu";
+  syncPartyToggle();
 }
 
 function setBoot(pct: number) {
@@ -260,11 +416,11 @@ function finishBoot() {
   bootPanel.hidden = true;
   statusRow.hidden = true;
   syncPlayBtn();
+  void refreshPartyStatus();
 }
 
 function setStatus(kind: "idle" | "ok" | "err" | "busy", message: string) {
   if (booting) return;
-  // Idle / prêt : rien sous les boutons
   if (kind === "idle") {
     statusRow.hidden = true;
     busy = false;
@@ -303,11 +459,11 @@ function syncStoreBtn() {
 
 function openConfig(open: boolean) {
   if (open) {
-    cfgPort.value = String(config.port);
-    cfgLobby.value = config.lobbyName;
     draftPath = config.gamePath;
     cfgGameText.textContent = shortPath(draftPath);
+    fillDraftFromConfig();
     syncStoreBtn();
+    syncPartyToggle();
     void autoDetectGame();
   }
   configEl.classList.toggle("open", open);
@@ -321,6 +477,11 @@ btnConfig.addEventListener("click", (e) => {
   openConfig(!isConfigOpen());
 });
 btnClose.addEventListener("click", () => openConfig(false));
+
+cfgName.addEventListener("input", () => {
+  cfgName.value = [...cfgName.value].slice(0, LOBBY_MAX_LEN).join("");
+  syncNameCount();
+});
 
 document.addEventListener("pointerdown", (e) => {
   if (!isConfigOpen()) return;
@@ -367,22 +528,57 @@ btnStore.addEventListener("click", async (e) => {
   }
 });
 
-btnSave.addEventListener("click", () => {
-  const lobbyName = (cfgLobby.value.trim() || "StubLobby").slice(0, LOBBY_MAX_LEN);
+function persistDraft(lobby?: {
+  name: string;
+  mapId: number;
+  gameMode: number;
+  levelId: number;
+}) {
+  const L = lobby ?? readLobbyDraft();
   config = {
-    port: Math.min(65535, Math.max(1, Number(cfgPort.value) || 7891)),
-    lobbyName,
-    lobbies: normalizeLobbies([...config.lobbies, lobbyName], lobbyName),
+    ...config,
     gamePath: draftPath,
+    lastLobbyName: L.name,
+    lastMapId: L.mapId,
+    lastGameMode: L.gameMode,
   };
-  cfgPort.value = String(config.port);
-  cfgLobby.value = config.lobbyName;
-  cfgGameText.textContent = shortPath(config.gamePath);
   saveConfig(config);
+  cfgGameText.textContent = shortPath(config.gamePath);
+}
+
+btnPartyToggle.addEventListener("click", async () => {
+  if (busy || booting) return;
+
+  if (partyLive) {
+    setStatus("busy", "Arrêt…");
+    try {
+      await invoke("stop_stub");
+      partyLive = false;
+      activeParty = null;
+      syncPartyToggle();
+      flashStatus("ok", "Partie arrêtée");
+    } catch (err) {
+      flashStatus("err", shortErr(err instanceof Error ? err.message : String(err)));
+      await refreshPartyStatus();
+    }
+    return;
+  }
+
+  const lobby = readLobbyDraft();
+  persistDraft(lobby);
   syncStoreBtn();
-  openConfig(false);
-  if (stubOnline) setStatus("ok", `En ligne — ${config.lobbyName}`);
-  else flashStatus("ok", "Config enregistrée");
+  setStatus("busy", "Création…");
+  try {
+    await ensurePartyWithDraft(lobby);
+    openConfig(false);
+    flashStatus(
+      "ok",
+      `« ${lobby.name} » · ${levelLabel(lobby.gameMode, lobby.mapId)}`,
+    );
+  } catch (err) {
+    flashStatus("err", shortErr(err instanceof Error ? err.message : String(err)));
+    await refreshPartyStatus();
+  }
 });
 
 let statusClearTimer = 0;
@@ -391,7 +587,8 @@ function flashStatus(kind: "ok" | "err", message: string, ms = 2200) {
   setStatus(kind, message);
   window.clearTimeout(statusClearTimer);
   statusClearTimer = window.setTimeout(() => {
-    if (!busy && !booting) setStatus("idle", "");
+    if (busy || booting) return;
+    setStatus("idle", "");
   }, ms);
 }
 
@@ -411,7 +608,7 @@ function shortErr(raw: string): string {
   }
   if (/déjà|already/i.test(msg)) return "Déjà en ligne";
   if (/port/i.test(msg) && /in use|EADDRINUSE|occup/i.test(msg)) {
-    return "Port occupé — change-le dans Config";
+    return "Une partie est déjà ouverte";
   }
   if (/network|fetch|ENOTFOUND|timed out|timeout|ECONN/i.test(msg)) {
     return "Réseau indisponible";
@@ -420,62 +617,43 @@ function shortErr(raw: string): string {
   return msg.length > 42 ? `${msg.slice(0, 39)}…` : msg;
 }
 
-async function refreshStatus() {
-  try {
-    const st = await invoke<StubStatus>("get_status");
-    stubOnline = st.running;
-    if (!st.stub_ready) {
-      setStatus("err", "Stub manquant — réinstalle BB-EMU");
-      return;
-    }
-    if (st.running) setStatus("ok", `En ligne — ${config.lobbyName}`);
-    else setStatus("idle", "");
-  } catch (e) {
-    flashStatus("err", shortErr(e instanceof Error ? e.message : String(e)));
-  }
-}
-
-btnLaunch.addEventListener("click", async () => {
-  if (busy || booting) return;
-
-  if (stubOnline) {
-    setStatus("busy", "Arrêt…");
-    try {
-      await invoke<string>("stop_stub");
-      stubOnline = false;
-      setStatus("idle", "");
-    } catch (e) {
-      flashStatus("err", shortErr(e instanceof Error ? e.message : String(e)));
-    }
-    return;
-  }
-
+async function launchGame() {
   if (!config.gamePath && draftPath) {
     config = { ...config, gamePath: draftPath };
     saveConfig(config);
   }
-
+  const lobby = readLobbyDraft();
+  persistDraft(lobby);
   setStatus("busy", "Lancement…");
   try {
-    const msg = await invoke<string>("launch_all", {
-      port: config.port,
-      lobbyName: config.lobbyName,
+    await ensurePartyWithDraft(lobby);
+    await invoke<string>("launch_game", {
       gamePath: config.gamePath,
+      lobbyName: lobby.name,
+      levelId: lobby.levelId,
+      mapId: lobby.mapId,
+      maxPlayers: 8,
+      gameMode: lobby.gameMode,
     });
-    stubOnline = true;
-    if (msg.includes("En ligne")) setStatus("ok", `En ligne — ${config.lobbyName}`);
-    else if (/échec|introuvable/i.test(msg)) flashStatus("err", shortErr(msg));
-    else setStatus("ok", shortErr(msg) || `En ligne — ${config.lobbyName}`);
+    flashStatus(
+      "ok",
+      `Jeu lancé · ${levelLabel(lobby.gameMode, lobby.mapId)}`,
+    );
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    if (msg.includes("déjà")) {
-      stubOnline = true;
-      setStatus("ok", `En ligne — ${config.lobbyName}`);
-    } else {
-      flashStatus("err", shortErr(msg));
-    }
+    flashStatus("err", shortErr(e instanceof Error ? e.message : String(e)));
+    await refreshPartyStatus();
   }
+}
+
+btnLaunch.addEventListener("click", () => {
+  if (busy || booting) return;
+  void launchGame();
 });
+
+window.setInterval(() => {
+  if (booting || busy) return;
+  void refreshPartyStatus();
+}, 2000);
 
 async function autoDetectGame() {
   const previous = config.gamePath;
@@ -558,22 +736,10 @@ async function boot() {
   await autoDetectGame();
 
   setBoot(Math.max(pct, 78));
-  try {
-    const st = await invoke<StubStatus>("get_status");
-    stubOnline = st.running;
-  } catch {
-    // ignore
-  }
-
   window.clearInterval(tick);
   setBoot(100);
   await new Promise((r) => setTimeout(r, 320));
   finishBoot();
-  if (stubOnline) setStatus("ok", `En ligne — ${config.lobbyName}`);
 }
-
-setInterval(() => {
-  if (!busy && !booting) refreshStatus();
-}, 3000);
 
 void boot();

@@ -17,6 +17,7 @@ const {
   buildStartLoading,
   buildStartGame,
   buildServerGameDetails,
+  buildLobbyDescriptor,
   buildReqClock,
   buildTimeSync,
   buildCommsPing,
@@ -40,9 +41,34 @@ function assert(cond, msg) {
 
 // --- unit checks ---
 {
-  const sg = buildServerGameDetails({ serverName: "StubLobby", playerCount: 1 });
+  const sg = buildServerGameDetails({
+    hostName: "MaPartie",
+    gameMode: 0,
+    mapId: 1,
+    playerCount: 2,
+    maxPlayers: 8,
+  });
   const p = parsePacket(sg);
   assert(p.ok && p.type === 0x02 && p.declaredLen === p.payload.length, "0x02");
+  // body: magic(4) + len(1) + name[4] + device[0x14]
+  assert(p.body[4] === 4, "0x02 name len");
+  assert(
+    p.body[5] === 0 && p.body[6] === 2 && p.body[7] === 8 && p.body[8] === 1,
+    "0x02 mode/count/max/map"
+  );
+  assert(p.body.subarray(9, 9 + 8).toString("utf8") === "MaPartie", "0x02 host device");
+}
+
+{
+  const { resolveModeMap, MODES } = require("./levels");
+  assert(MODES[1].label.includes("drapeau"), "mode 1 = CTF");
+  const domMad = resolveModeMap({ mode: 0, map: 1 });
+  assert(domMad.mapId === 1 && domMad.modeId === 0, "Dom/Madagascar");
+}
+
+{
+  const d = buildLobbyDescriptor({ gameMode: 1, mapId: 4, maxPlayers: 8, flags: 0 });
+  assert(d.equals(Buffer.from([1, 4, 8, 0])), "descriptor");
 }
 
 {

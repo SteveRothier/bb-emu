@@ -5,8 +5,12 @@
  * Keepalive after 0x11: 0x06 ReqClock → (0x07) → 0x08 TimeSync → 0x12 StartGame
  * ACK: on flag≠0 inbound, emit 0x0F with peerB/seqMask (piggybacked on all replies too)
  * Ping: every 3s after join, 0x0D + 0x0E
+ *
+ * CLI (prioritaire sur env):
+ *   --port N --lobby NAME --map ID --max-players N --mode N --level N --log PATH
  */
 
+const fs = require("fs");
 const dgram = require("dgram");
 const {
   parsePacket,
@@ -15,6 +19,7 @@ const {
   typeName,
   buildServerGameDetails,
   buildLobbyDetails,
+  buildLobbyDescriptor,
   buildNewPlayer,
   buildStartLoading,
   buildStartGame,
@@ -23,19 +28,73 @@ const {
   buildCommsPing,
   buildPlayerPings,
   buildAckOnly,
-  buildPositionsBundle,
+  buildPositionsEnvelope,
   parsePlayerTransform,
   createAckState,
   noteReliableSeq,
   ackHeaderFields,
   GAME_ID,
 } = require("./packet");
+const { resolveModeMap } = require("./levels");
 
-const PORT = Number(process.env.BB_MP_PORT || 7891);
+function parseArgs(argv) {
+  const out = {};
+  for (let i = 2; i < argv.length; i++) {
+    const a = argv[i];
+    if (!a.startsWith("--")) continue;
+    const key = a.slice(2);
+    const next = argv[i + 1];
+    if (next != null && !next.startsWith("--")) {
+      out[key] = next;
+      i++;
+    } else {
+      out[key] = true;
+    }
+  }
+  return out;
+}
+
+function clampU8(n, fallback) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return fallback;
+  return Math.max(0, Math.min(255, v | 0));
+}
+
+const args = parseArgs(process.argv);
+
+const PORT = Number(args.port || process.env.BB_MP_PORT || 7891);
 const HOST = process.env.BB_MP_HOST || "0.0.0.0";
-const LOBBY_NAME = process.env.BB_LOBBY_NAME || "StubLobby";
+const LOBBY_NAME = String(args.lobby || process.env.BB_LOBBY_NAME || "MaPartie")
+  .trim()
+  .slice(0, 16) || "MaPartie";
+const MAX_PLAYERS = clampU8(args["max-players"] ?? process.env.BB_MAX_PLAYERS, 8) || 8;
+const LOBBY = resolveModeMap({
+  mode: args.mode ?? process.env.BB_GAME_MODE,
+  map: args.map ?? process.env.BB_MAP_ID,
+});
+const MAP_ID = LOBBY.mapId;
+const GAME_MODE = LOBBY.modeId;
 const PING_MS = Number(process.env.BB_MP_PING_MS || 3000);
 const CLOCK_FALLBACK_MS = Number(process.env.BB_MP_CLOCK_FALLBACK_MS || 500);
+
+if (args.log) {
+  try {
+    const logPath = String(args.log);
+    const stream = fs.createWriteStream(logPath, { flags: "a" });
+    const wrap = (fn) => (chunk) => {
+      try {
+        stream.write(chunk);
+      } catch (_) {
+        /* ignore */
+      }
+      fn(chunk);
+    };
+    process.stdout.write = wrap(process.stdout.write.bind(process.stdout));
+    process.stderr.write = wrap(process.stderr.write.bind(process.stderr));
+  } catch (e) {
+    console.error("log file open failed", e.message);
+  }
+}
 
 const peers = new Map();
 
@@ -92,18 +151,28 @@ function playerFromDetails(details, deviceId = 0) {
   };
 }
 
+function connectedCount() {
+  let n = 1; // host slot
+  for (const p of peers.values()) {
+    if (p.joined) n++;
+  }
+  return Math.min(n, MAX_PLAYERS);
+}
+
 function sendDiscoverReply(sock, rinfo, peer) {
   send(
     sock,
     buildServerGameDetails({
       magic: GAME_ID,
-      serverName: LOBBY_NAME.length >= 2 ? LOBBY_NAME : "St",
-      playerCount: 1,
-      deviceName: "stub-host",
+      gameMode: GAME_MODE,
+      mapId: MAP_ID,
+      playerCount: connectedCount(),
+      maxPlayers: MAX_PLAYERS,
+      hostName: LOBBY_NAME,
       headerOpts: headerOpts(peer),
     }),
     rinfo,
-    "0x02 ServerGameDetails"
+    `0x02 ServerGameDetails ${LOBBY.label}`
   );
   peer.discoverReplied = true;
 }
@@ -117,7 +186,12 @@ function sendJoinSequence(sock, rinfo, peer) {
     sock,
     buildLobbyDetails({
       seq: 1,
-      descriptor: Buffer.from([0x00, 0x01, 0x00, 0x00]),
+      descriptor: buildLobbyDescriptor({
+        gameMode: GAME_MODE,
+        mapId: MAP_ID,
+        maxPlayers: MAX_PLAYERS,
+        flags: 0,
+      }),
       players: [player],
       headerOpts: opts,
     }),
@@ -200,7 +274,10 @@ const sock = dgram.createSocket("udp4");
 sock.on("listening", () => {
   const a = sock.address();
   console.log(`bb-mp-stub listening UDP ${a.address}:${a.port}`);
-  console.log(`lobby="${LOBBY_NAME}" gameId=0x${GAME_ID.toString(16)} ping=${PING_MS}ms`);
+  console.log(
+    `lobby="${LOBBY_NAME}" ${LOBBY.label} map=${MAP_ID} mode=${GAME_MODE} ` +
+      `max=${MAX_PLAYERS} gameId=0x${GAME_ID.toString(16)} ping=${PING_MS}ms`
+  );
 });
 
 sock.on("message", (msg, rinfo) => {
@@ -260,6 +337,24 @@ sock.on("message", (msg, rinfo) => {
     return;
   }
 
+  if (parsed.type === 0x14) {
+    // Client → host : demande d'état à l'entrée en jeu (réponse via inject).
+    console.log(`  SyncRequest seq=${parsed.header.peerA}`);
+    return;
+  }
+
+  if (parsed.type === 0x61) {
+    // Client → host : choix équipe/classe — body = id, faction, class.
+    const id = parsed.body[0] || 0;
+    const faction = parsed.body[1] || 0;
+    const classId = parsed.body[2] || 0;
+    peer.classSelect = { id, faction, classId };
+    console.log(
+      `  ClassSelect id=${id} faction=${faction} class=${classId} seq=${parsed.header.peerA}`
+    );
+    return;
+  }
+
   if (parsed.type === 0x0f) {
     return;
   }
@@ -282,26 +377,22 @@ sock.on("message", (msg, rinfo) => {
         }
       }
     }
-    // Echo a minimal server-style bundle so a future client can see host positions.
+    // Echo 0x4D only — NEVER echo 0x17 with the client's pitchByte.
+    // Replaying pitch=199 locked the local camera looking at the floor.
     if (peer.started || peer.joined) {
-      const trMsg = msgs.find((m) => m.type === 0x17);
-      const tr = trMsg ? parsePlayerTransform(trMsg.body) : null;
       const env = msgs.find((m) => m.type === 0x4d);
-      const timeMs = env && env.body.length >= 4 ? env.body.readUInt32BE(0) : Date.now() & 0xffffffff;
+      const timeMs =
+        env && env.body.length >= 4
+          ? env.body.readUInt32BE(0)
+          : Date.now() & 0xffffffff;
       send(
         sock,
-        buildPositionsBundle({
+        buildPositionsEnvelope({
           timeMs,
-          playerId: tr ? tr.playerId : 0,
-          qx: tr ? tr.qx : 0,
-          qy: tr ? tr.qy : 0,
-          qz: tr ? tr.qz : 0,
-          yawByte: tr ? tr.yawByte : 0,
-          pitchByte: tr ? tr.pitchByte : 0,
           headerOpts: headerOpts(peer),
         }),
         rinfo,
-        "0x4D+0x17 PositionsEcho"
+        "0x4D PositionsEcho"
       );
     }
     return;

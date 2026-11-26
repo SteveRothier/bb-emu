@@ -36,6 +36,7 @@
     "resources": {
       "../bb-mp-stub/server.js": "bb-mp-stub/server.js",
       "../bb-mp-stub/packet.js": "bb-mp-stub/packet.js",
+      "../bb-mp-stub/levels.js": "bb-mp-stub/levels.js",
       "../bb-mp-stub/package.json": "bb-mp-stub/package.json"
     },
     "icon": [

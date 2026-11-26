@@ -9,7 +9,7 @@
 const HEADER_SIZE = 13;
 const GAME_ID = 0x0ab25571;
 
-/** Size table DAT_00c3fcd0 excerpt — 0xFFFFFF means VAR */
+/** Size table DAT_00c3a280 — 0xFFFFFF means VAR (extrait utile + 0x14/0x61). */
 const SIZE_TABLE = {
   0x01: 5,
   0x02: 0xffffff,
@@ -18,15 +18,26 @@ const SIZE_TABLE = {
   0x06: 2,
   0x07: 6,
   0x08: 9,
+  0x0b: 1,
   0x0d: 9,
   0x0e: 0xffffff,
   0x0f: 1,
   0x10: 9,
   0x11: 1,
   0x12: 13,
+  0x13: 14,
+  0x14: 1,
+  0x15: 0xffffff,
   0x16: 30,
   0x17: 10,
+  0x25: 0xffffff,
   0x4d: 5,
+  0x61: 4,
+  0x62: 0xffffff,
+  0x63: 0xffffff,
+  0x6d: 5,
+  0x78: 217,
+  0x80: 0xffffff,
 };
 
 function u16be(n) {
@@ -82,34 +93,61 @@ function buildDiscover({ magic = GAME_ID } = {}) {
 
 /**
  * 0x02 ServerGameDetails (VAR) — host → client on Discover.
- * body: u32be gameId | u8 L + name | deviceName[0x14]
- * name[1] is overwritten with connected-player count (host included).
+ * FUN_0074fd80 / liste UI (FUN_0074dbf0):
+ *   body: u32be gameId | u8 L + nameBytes | deviceName[0x14]
+ * nameBytes (L=4) — host stamp name[1]=playerCount ;
+ * Joueurs UI = name[1]/name[2] :
+ *   [0] gameMode | [1] playerCount | [2] maxPlayers | [3] mapId
+ * deviceName[0x14] = nom d'hôte (« Comms: Discovered Server name %s »).
  */
 function buildServerGameDetails({
   magic = GAME_ID,
-  serverName = "Stub",
+  gameMode = 0,
+  mapId = 0,
   playerCount = 1,
-  deviceName = "stub-host",
+  maxPlayers = 8,
+  // legacy ignored
+  levelIndex,
+  hostName = "MaPartie",
+  serverName,
+  deviceName,
   headerOpts,
 } = {}) {
-  const nameBuf = Buffer.from(serverName, "utf8");
-  if (nameBuf.length < 2) {
-    // Need index 1 for player-count stamp.
-    const padded = Buffer.alloc(2);
-    nameBuf.copy(padded);
-    padded[1] = playerCount & 0xff;
-    const body = Buffer.concat([u32be(magic), Buffer.from([2]), padded, padName20(deviceName)]);
-    return wrapVar(0x02, body, headerOpts);
-  }
-  const stamped = Buffer.from(nameBuf);
-  stamped[1] = playerCount & 0xff;
+  const host = hostName || deviceName || serverName || "MaPartie";
+  void levelIndex;
+  const slots = maxPlayers < 2 ? 8 : maxPlayers & 0xff;
+  const nameBytes = Buffer.from([
+    gameMode & 0xff,
+    playerCount & 0xff,
+    slots,
+    mapId & 0xff,
+  ]);
   const body = Buffer.concat([
     u32be(magic),
-    Buffer.from([stamped.length]),
-    stamped,
-    padName20(deviceName),
+    Buffer.from([nameBytes.length]),
+    nameBytes,
+    padName20(host),
   ]);
   return wrapVar(0x02, body, headerOpts);
+}
+
+/**
+ * Descriptor opaque du 0x05 (stocké lobby+0x30 / len+0x34, setter FUN_0068ec70).
+ * Champs UI liés: Infamous_GameMode, Infamous_MapIdx, Infamous_MaxPlayers.
+ * Layout: [gameMode, mapId, maxPlayers, flags] — mode/carte du niveau MP choisi.
+ */
+function buildLobbyDescriptor({
+  gameMode = 0,
+  mapId = 0,
+  maxPlayers = 8,
+  flags = 0,
+} = {}) {
+  return Buffer.from([
+    gameMode & 0xff,
+    mapId & 0xff,
+    maxPlayers & 0xff,
+    flags & 0xff,
+  ]);
 }
 
 /**
@@ -149,13 +187,14 @@ function cString(buf) {
 }
 
 /**
- * 0x05 LobbyDetails (VAR) — FUN_00690060.
+ * 0x05 LobbyDetails (VAR) — MP_ServerSendLocalLobbyDetails (FUN_00690060).
  * body: u32be seq | u8 descLen + descriptor | u8 N |
  *   N × { name[0x14], u8 apLen + appearance, u8 deviceId }
+ * Player slot stride in host memory: 0x40 (name@0, apPtr@0x14, apLen@0x18, deviceId@0x1c).
  */
 function buildLobbyDetails({
   seq = 1,
-  descriptor = Buffer.from([0x00, 0x01, 0x00, 0x00]),
+  descriptor = buildLobbyDescriptor({}),
   players = [],
   headerOpts,
 } = {}) {
@@ -482,9 +521,17 @@ function typeName(t) {
     0x10: "StartLoading",
     0x11: "FinishedLoading",
     0x12: "StartGame",
+    0x13: "ScoreUpdate",
+    0x14: "SyncRequest",
+    0x15: "MatchState",
     0x16: "NewPlayer",
     0x17: "PlayerTransform",
+    0x25: "Respawn",
     0x4d: "PositionsEnvelope",
+    0x61: "ClassSelect",
+    0x62: "ClassConfirm",
+    0x6d: "MatchStart",
+    0x78: "MatchBlob",
   };
   return names[t] || `Type_0x${t.toString(16)}`;
 }
@@ -499,6 +546,7 @@ module.exports = {
   padName20,
   buildDiscover,
   buildServerGameDetails,
+  buildLobbyDescriptor,
   buildClientDetails,
   parseClientDetails,
   buildLobbyDetails,
