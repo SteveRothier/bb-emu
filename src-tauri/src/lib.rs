@@ -1,10 +1,10 @@
-#![allow(dead_code)] // probe CamMgr : helpers touch/stomp temporairement dormants
+#![allow(dead_code)] // restores/hooks legacy encore utiles en heal ; installs dormants
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -16,7 +16,7 @@ use tauri::{AppHandle, Manager, State};
 #[derive(Clone)]
 struct LobbyConfig {
     host_name: String,
-    /// Index MP level (name[0] du 0x02) — mode×carte.
+    /// Legacy dense id (logs) — stream / 0x02 = `level_load_idx`.
     level_id: u8,
     map_id: u8,
     max_players: u8,
@@ -74,6 +74,17 @@ pub(crate) fn append_log(app: &AppHandle, line: &str) {
 }
 
 fn stub_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    // Dev : préférer le dossier source — tauri ne re-copie pas toujours
+    // `resources` vers target/debug, d'où des 0x02 encore en `wire=`.
+    let from_manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("bb-mp-stub");
+    if let Ok(p) = from_manifest.canonicalize() {
+        if p.join("server.js").exists() {
+            return Ok(p);
+        }
+    }
+
     if let Ok(resource) = app.path().resource_dir() {
         let packaged = resource.join("bb-mp-stub");
         if packaged.join("server.js").exists() {
@@ -93,19 +104,10 @@ fn stub_dir(app: &AppHandle) -> Result<PathBuf, String> {
         }
     }
 
-    let from_manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("bb-mp-stub");
-    let from_manifest = from_manifest
-        .canonicalize()
-        .map_err(|e| format!("bb-mp-stub introuvable: {e}"))?;
-    if !from_manifest.join("server.js").exists() {
-        return Err(format!(
-            "server.js manquant dans {}",
-            from_manifest.display()
-        ));
-    }
-    Ok(from_manifest)
+    Err(format!(
+        "bb-mp-stub introuvable (source {})",
+        from_manifest.display()
+    ))
 }
 
 fn stub_is_running(state: &StubState) -> bool {
@@ -239,6 +241,53 @@ fn normalize_lobby_name(lobby_name: &str) -> String {
     name.chars().take(16).collect::<String>()
 }
 
+fn lobby_live_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(stub_dir(app)?.join("lobby-live.json"))
+}
+
+fn write_lobby_live_file(app: &AppHandle, lobby: &LobbyConfig) -> Result<(), String> {
+    write_lobby_live_file_ex(app, lobby, None)
+}
+
+fn write_lobby_live_file_ex(
+    app: &AppHandle,
+    lobby: &LobbyConfig,
+    level_table_idx: Option<u8>,
+) -> Result<(), String> {
+    let path = lobby_live_path(app)?;
+    let mut body = serde_json::json!({
+        "hostName": lobby.host_name,
+        "mapId": lobby.map_id,
+        "modeId": lobby.game_mode,
+        "maxPlayers": lobby.max_players,
+    });
+    let title = level_title_idx(lobby.game_mode, lobby.map_id);
+    let load = level_table_idx.unwrap_or_else(|| level_load_idx(lobby.game_mode, lobby.map_id));
+    body["titleIdx"] = serde_json::json!(title);
+    body["loadIdx"] = serde_json::json!(load);
+    // Compat stub : levelIdx = load (MapIdx / 0x10) — pas le retail 0x02.
+    body["levelIdx"] = serde_json::json!(load);
+    fs::write(&path, body.to_string())
+        .map_err(|e| format!("écriture lobby-live.json: {e}"))?;
+    Ok(())
+}
+
+/// true si inject MODE=1 (Connect/join en cours) — geler map/mode.
+#[cfg(windows)]
+fn inject_join_active() -> bool {
+    let Some(inj) = resolve_inject_cave() else {
+        return false;
+    };
+    read_inject_meta(inj.process.0, inj.cave)
+        .map(|(mode, _, _, _)| mode == 1)
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn inject_join_active() -> bool {
+    false
+}
+
 fn spawn_stub(
     app: &AppHandle,
     state: &StubState,
@@ -249,13 +298,20 @@ fn spawn_stub(
     max_players: u8,
     game_mode: u8,
 ) -> Result<(), String> {
+    // Remplacer seulement au Créer / stub mort — les flèches passent par update_party_lobby.
     {
         let mut guard = state.child.lock().map_err(|_| "lock stub".to_string())?;
-        if let Some(child) = guard.as_mut() {
-            if is_child_running(child) {
-                return Err("Stub déjà en cours".to_string());
+        if let Some(mut child) = guard.take() {
+            if is_child_running(&mut child) {
+                append_log(
+                    app,
+                    &format!(
+                        "remplacement stub (map={map_id} mode={game_mode} level={level_id})"
+                    ),
+                );
             }
-            *guard = None;
+            kill_process_tree(&mut child);
+            sleep(Duration::from_millis(120));
         }
     }
 
@@ -316,16 +372,17 @@ fn spawn_stub(
         .spawn()
         .map_err(|e| format!("Impossible de démarrer le stub: {e}"))?;
 
-    // Commit lobby seulement après spawn réussi.
     {
         let mut lobby_guard = state.lobby.lock().map_err(|_| "lock lobby".to_string())?;
         *lobby_guard = cfg.clone();
     }
+    let level_idx = resolve_level_table_idx_static(cfg.game_mode, cfg.map_id);
+    let _ = write_lobby_live_file_ex(app, &cfg, Some(level_idx));
 
     append_log(
         app,
         &format!(
-            "stub desktop port={port} lobby={} level={} map={} mode={} max={} node={} server={}",
+            "stub desktop port={port} lobby={} level={} map={} mode={} levelIdx={level_idx} max={} node={} server={}",
             cfg.host_name,
             cfg.level_id,
             cfg.map_id,
@@ -339,6 +396,110 @@ fn spawn_stub(
     let mut guard = state.child.lock().map_err(|_| "lock stub".to_string())?;
     *guard = Some(child);
     Ok(())
+}
+
+/// Hot-update map/mode sans tuer le Node (flèches UI). Gelé si join MODE=1.
+fn update_party_lobby_inner(
+    app: &AppHandle,
+    state: &StubState,
+    port: u16,
+    lobby_name: &str,
+    level_id: u8,
+    map_id: u8,
+    max_players: u8,
+    game_mode: u8,
+) -> Result<String, String> {
+    if inject_join_active() {
+        append_log(app, "lobby frozen (join in progress)");
+        return Ok("lobby frozen (join in progress)".into());
+    }
+
+    let lobby = normalize_lobby_name(lobby_name);
+    let max_players = if max_players == 0 { 8 } else { max_players };
+    let cfg = LobbyConfig {
+        host_name: lobby,
+        level_id,
+        map_id,
+        max_players,
+        game_mode,
+    };
+
+    let level_idx = try_resolve_level_table_idx_live(&cfg)
+        .unwrap_or_else(|| resolve_level_table_idx_static(cfg.game_mode, cfg.map_id));
+
+    if !stub_is_running(state) {
+        spawn_stub(
+            app,
+            state,
+            port,
+            &cfg.host_name,
+            level_id,
+            map_id,
+            max_players,
+            game_mode,
+        )?;
+        write_lobby_live_file_ex(app, &cfg, Some(level_idx))?;
+        let sync = sync_lobby_inject_live(&cfg).unwrap_or_else(|e| e);
+        return Ok(format!(
+            "stub démarré map={} mode={} levelIdx={level_idx} ({sync})",
+            map_id, game_mode
+        ));
+    }
+
+    {
+        let mut guard = state.lobby.lock().map_err(|_| "lock lobby".to_string())?;
+        *guard = cfg.clone();
+    }
+    write_lobby_live_file_ex(app, &cfg, Some(level_idx))?;
+    let sync = sync_lobby_inject_live(&cfg).unwrap_or_else(|e| e);
+    // Re-résoudre après sync (table live dispo) et rafraîchir lobby-live.
+    let level_idx = try_resolve_level_table_idx_live(&cfg).unwrap_or(level_idx);
+    write_lobby_live_file_ex(app, &cfg, Some(level_idx))?;
+    append_log(
+        app,
+        &format!(
+            "lobby hot-update map={} mode={} levelIdx={} without stub restart ({sync})",
+            map_id, game_mode, level_idx
+        ),
+    );
+    Ok(format!(
+        "lobby hot-update carte {map_id} mode {game_mode} levelIdx={level_idx}"
+    ))
+}
+
+/// Résout l'index table 33 si le jeu est attachable ; sinon `None` (caller → static).
+#[cfg(windows)]
+fn try_resolve_level_table_idx_live(lobby: &LobbyConfig) -> Option<u8> {
+    let pid = find_game_pid()?;
+    let process = unsafe { OpenProcess(0x0438, 0, pid) };
+    if process.is_null() {
+        return None;
+    }
+    let process = ProcessHandle(process);
+    let mut peb32: u64 = 0;
+    let mut returned = 0u32;
+    let status = unsafe {
+        NtQueryInformationProcess(
+            process.0,
+            26,
+            &mut peb32 as *mut u64 as *mut _,
+            8,
+            &mut returned,
+        )
+    };
+    if status != 0 || peb32 == 0 {
+        return None;
+    }
+    let mut image = 0u32;
+    if read_exact(process.0, peb32 + 8, &mut image).is_err() || image == 0 {
+        return None;
+    }
+    resolve_level_table_idx(process.0, image, lobby.game_mode, lobby.map_id).map(|(i, _)| i)
+}
+
+#[cfg(not(windows))]
+fn try_resolve_level_table_idx_live(_lobby: &LobbyConfig) -> Option<u8> {
+    None
 }
 
 const STORE_PACKAGE_NAME: &str = "GAMELOFTSA.BlitzBrigade";
@@ -636,6 +797,7 @@ fn open_menu_sections_inner(
     // L'inbound UWP ne remplit jamais comms+0x514. On injecte un 0x02
     // dans le chemin recv pour peupler la liste via FUN_0074dbf0.
     install_discover_inject(process, image, lobby)?;
+    let _ = apply_mp_selection_to_game(process, image, lobby);
     // Le login fédération expiré empile l'écran « délai de la demande ».
     // On retire cet état et on revient au menu, sans le chemin SUCCESS.
     patch_code(
@@ -763,18 +925,18 @@ fn wrap_inject_var(type_id: u8, body: &[u8]) -> Vec<u8> {
 }
 
 /// Paquet 0x02 ServerGameDetails pour la liste UI.
-/// Hôte = device[0x14] ; name = [gameMode, playerCount, maxPlayers, mapId].
-/// Joueurs lit name[1]/name[2] (sinon mapId=0 → affichage « 1/0 »).
+/// Hôte = device[0x14] ; name = [load, playerCount, maxPlayers, load].
+/// GetMPMapName(name[3]) = index **table 33** (wire=0 → Cathédrale).
 #[cfg(windows)]
 fn build_inject_server_details(
     host_display: &str,
-    game_mode: u8,
-    map_id: u8,
+    load_a: u8,
+    load_b: u8,
     player_count: u8,
     max_players: u8,
 ) -> Vec<u8> {
     let max_players = if max_players < 2 { 8 } else { max_players };
-    let name = [game_mode, player_count, max_players, map_id];
+    let name = [load_a, player_count, max_players, load_b];
     let device_buf = pad_name20(host_display);
     let mut body = Vec::with_capacity(4 + 1 + name.len() + 0x14);
     body.extend_from_slice(&GAME_ID_BE.to_be_bytes());
@@ -784,7 +946,20 @@ fn build_inject_server_details(
     wrap_inject_var(0x02, &body)
 }
 
-/// 0x05 LobbyDetails — descriptor [mode,map,max,flags] + 1 joueur.
+/// Octets name[0..3] du 0x02 = **load** table (titre GetMPMapName).
+/// MapIdx / 0x10 aussi via apply_mp (load) — pas le wire (0 = Cathédrale).
+fn lobby_02_name_bytes(lobby: &LobbyConfig, player_count: u8) -> [u8; 4] {
+    let max_players = if lobby.max_players < 2 {
+        8
+    } else {
+        lobby.max_players
+    };
+    let load = level_load_idx(lobby.game_mode, lobby.map_id);
+    [load, player_count, max_players, load]
+}
+
+/// 0x05 LobbyDetails — descriptor [mode, load_idx, max, flags] + 1 joueur.
+/// map = load table (pas retail) — sinon Select traite 2 comme Quais.
 #[cfg(windows)]
 fn build_inject_lobby_details(lobby: &LobbyConfig, player_name: &str) -> Vec<u8> {
     let max_players = if lobby.max_players < 2 {
@@ -792,9 +967,11 @@ fn build_inject_lobby_details(lobby: &LobbyConfig, player_name: &str) -> Vec<u8>
     } else {
         lobby.max_players
     };
+    let load = level_load_idx(lobby.game_mode, lobby.map_id);
+    let stream_mode = level_stream_mode(lobby.game_mode, lobby.map_id);
     let desc = [
-        lobby.game_mode,
-        lobby.map_id,
+        stream_mode,
+        load,
         max_players,
         0u8,
     ];
@@ -823,9 +1000,20 @@ fn build_inject_new_player(player_name: &str) -> Vec<u8> {
 }
 
 /// 0x10 StartLoading (fixe 9).
+/// Handler client (`Received MP_MESSAGE_STARTLOADING`) :
+///   b0 → mp+0x3100 (MapIdx = index table 33), b1 → mp+0x30fc (GameMode).
+/// Zéro = Cathédrale / Domination — d'où le bug.
 #[cfg(windows)]
-fn build_inject_start_loading() -> Vec<u8> {
-    wrap_inject_payload(&[0x10, 0, 0, 0, 0, 0, 0, 0, 0])
+fn build_inject_start_loading(lobby: &LobbyConfig, level_table_idx: u8) -> Vec<u8> {
+    let stream_mode = level_stream_mode(lobby.game_mode, lobby.map_id);
+    let mut payload = Vec::with_capacity(9);
+    payload.push(0x10);
+    payload.push(0); // playerId
+    payload.push(level_table_idx); // → mp+0x3100
+    payload.extend_from_slice(&0u32.to_be_bytes()); // → mp+0x3104
+    payload.push(stream_mode); // → mp+0x30fc (peut ≠ lobby si TDM→FFA stream)
+    payload.push(0); // → mp+0x3110
+    wrap_inject_payload(&payload)
 }
 
 /// ACK fiable pour seq 0 (0x03) + seq 1 (0x11) : peerB=1, mask bits 0+1.
@@ -1169,16 +1357,17 @@ fn inject_push_batch(
     Ok(true)
 }
 
-/// Phase A join (avant FinishedLoading 0x11) : lobby → StartLoading → ACK.
+/// Phase A1 join : LobbyDetails + ACK×2 — **sans** 0x10.
+/// StartLoading part en A2 après écriture MapIdx/GameMode (sinon Cathédrale).
 /// Pas de 0x16 : avec le bypass filtre snapshot, NewPlayer AV (tables vides).
-/// Horloge / StartGame viennent plus tard (sinon trop tôt vs stub réel).
 #[cfg(windows)]
 fn build_join_inject_packets(lobby: &LobbyConfig) -> Result<Vec<Vec<u8>>, String> {
     let player = "Player";
+    let ack = build_inject_ack_only(JOIN_ACK_PEER_B, JOIN_ACK_MASK);
     let packets = vec![
         build_inject_lobby_details(lobby, player),
-        build_inject_start_loading(),
-        build_inject_ack_only(JOIN_ACK_PEER_B, JOIN_ACK_MASK),
+        ack.clone(),
+        ack,
     ];
     for (i, p) in packets.iter().enumerate() {
         if p.is_empty() || p.len() > INJECT_SLOT_SIZE as usize {
@@ -1186,6 +1375,17 @@ fn build_join_inject_packets(lobby: &LobbyConfig) -> Result<Vec<Vec<u8>>, String
         }
     }
     Ok(packets)
+}
+
+/// Phase A2 : StartLoading après MapIdx/GameMode forcés en mémoire.
+#[cfg(windows)]
+fn build_phase_a_start_loading_batch(lobby: &LobbyConfig, level_table_idx: u8) -> [Vec<u8>; 3] {
+    let ack = build_inject_ack_only(JOIN_ACK_PEER_B, JOIN_ACK_MASK);
+    [
+        build_inject_start_loading(lobby, level_table_idx),
+        ack.clone(),
+        ack,
+    ]
 }
 
 #[cfg(windows)]
@@ -1209,6 +1409,23 @@ const INJECT_DISCOVER_LEN_OFF: u32 = 0x2E4; // u16
 const INJECT_JOIN_NO_PEER_OFF: u32 = 0x2E6; // u8 join sans peer [comms+0x194]
 #[cfg(windows)]
 const INJECT_JOIN_LENS_OFF: u32 = 0x2E8; // u16[6]
+/// Index table 33 forcé → mp+0x3100 / 0x10 (hook off).
+#[cfg(windows)]
+const INJECT_FORCE_MAP_OFF: u32 = 0x2DC;
+#[cfg(windows)]
+const INJECT_FORCE_MODE_OFF: u32 = 0x2DD;
+/// Id carte retail 0..5 → menu+0x58 (GetMPLevel) — distinct de la table 33.
+#[cfg(windows)]
+const INJECT_FORCE_RETAIL_MAP_OFF: u32 = 0x2DE;
+/// 1 = select stub exécute native set (one-shot).
+#[cfg(windows)]
+const INJECT_NATIVE_ARM_OFF: u32 = 0x2DF;
+/// Shellcode SetMode/SetLevel + refresh table (après slots join 0x380+3*0x200).
+#[cfg(windows)]
+const INJECT_NATIVE_SET_STUB_OFF: u32 = 0x980;
+/// Trampoline hook get_level_entry (imul *0x84).
+#[cfg(windows)]
+const INJECT_LEVEL_HOOK_STUB_OFF: u32 = 0xA40;
 #[cfg(windows)]
 const INJECT_DISCOVER_PKT_OFF: u32 = 0x300;
 /// Discover tient dans 0x300..0x380.
@@ -1440,20 +1657,30 @@ fn install_join_arm_hook(
 fn write_inject_packet_blobs(
     process: *mut std::ffi::c_void,
     cave: u32,
+    _image: u32,
     lobby: &LobbyConfig,
     arm_discover: bool,
 ) -> Result<(), String> {
+    let mut cur_mode = [0u8];
+    let _ = read_bytes(
+        process,
+        cave as u64 + INJECT_MODE_OFF as u64,
+        &mut cur_mode,
+    );
+    let joining = cur_mode[0] == 1;
+
+    // 0x02 : name[0]=name[3]=load (SetMPLevel / GetMPMapName ; title hors wire).
+    let name = lobby_02_name_bytes(lobby, 1);
     let discover = build_inject_server_details(
         &lobby.host_name,
-        lobby.game_mode,
-        lobby.map_id,
-        1,
-        lobby.max_players,
+        name[0],
+        name[3],
+        name[1],
+        name[2],
     );
     if discover.is_empty() || discover.len() > INJECT_DISCOVER_MAX as usize {
         return Err("paquet discover inject trop grand".into());
     }
-    let join_pkts = build_join_inject_packets(lobby)?;
 
     write_exact(
         process,
@@ -1468,31 +1695,30 @@ fn write_inject_packet_blobs(
     )
     .map_err(|_| format!("écriture pkt discover refusée (code {})", last_error()))?;
 
-    for (i, pkt) in join_pkts.iter().enumerate() {
-        let len_off = cave + INJECT_JOIN_LENS_OFF + (i as u32) * 2;
-        let pkt_off = cave + INJECT_JOIN_PKT_BASE + (i as u32) * INJECT_SLOT_SIZE;
-        write_exact(process, len_off as u64, &(pkt.len() as u16).to_le_bytes())
-            .map_err(|_| format!("écriture len join[{i}] refusée (code {})", last_error()))?;
-        write_exact(process, pkt_off as u64, pkt)
-            .map_err(|_| format!("écriture pkt join[{i}] refusée (code {})", last_error()))?;
+    // Pendant join (MODE=1) : ne pas écraser 0x05/0x10 déjà en file.
+    if !joining {
+        let join_pkts = build_join_inject_packets(lobby)?;
+        for (i, pkt) in join_pkts.iter().enumerate() {
+            let len_off = cave + INJECT_JOIN_LENS_OFF + (i as u32) * 2;
+            let pkt_off = cave + INJECT_JOIN_PKT_BASE + (i as u32) * INJECT_SLOT_SIZE;
+            write_exact(process, len_off as u64, &(pkt.len() as u16).to_le_bytes())
+                .map_err(|_| format!("écriture len join[{i}] refusée (code {})", last_error()))?;
+            write_exact(process, pkt_off as u64, pkt)
+                .map_err(|_| format!("écriture pkt join[{i}] refusée (code {})", last_error()))?;
+        }
     }
 
-    if arm_discover {
-        // Ne pas écraser un join en cours (MODE=1) — sync Créer / refresh.
-        let mut cur_mode = [0u8];
-        let _ = read_bytes(process, cave as u64 + INJECT_MODE_OFF as u64, &mut cur_mode);
-        if cur_mode[0] != 1 {
-            write_exact(process, cave as u64 + INJECT_MODE_OFF as u64, &[0u8])
-                .map_err(|_| format!("écriture mode refusée (code {})", last_error()))?;
-            write_exact(process, cave as u64 + INJECT_IDX_OFF as u64, &[0u8])
-                .map_err(|_| format!("écriture idx refusée (code {})", last_error()))?;
-            write_exact(process, cave as u64 + INJECT_HITS_OFF as u64, &[0u8])
-                .map_err(|_| format!("écriture hits refusée (code {})", last_error()))?;
-            write_exact(process, cave as u64 + INJECT_JOIN_OK_OFF as u64, &[0u8])
-                .map_err(|_| format!("écriture join_ok refusée (code {})", last_error()))?;
-            write_exact(process, cave as u64 + INJECT_JOIN_NO_PEER_OFF as u64, &[0u8])
-                .map_err(|_| format!("écriture no_peer refusée (code {})", last_error()))?;
-        }
+    if arm_discover && !joining {
+        write_exact(process, cave as u64 + INJECT_MODE_OFF as u64, &[0u8])
+            .map_err(|_| format!("écriture mode refusée (code {})", last_error()))?;
+        write_exact(process, cave as u64 + INJECT_IDX_OFF as u64, &[0u8])
+            .map_err(|_| format!("écriture idx refusée (code {})", last_error()))?;
+        write_exact(process, cave as u64 + INJECT_HITS_OFF as u64, &[0u8])
+            .map_err(|_| format!("écriture hits refusée (code {})", last_error()))?;
+        write_exact(process, cave as u64 + INJECT_JOIN_OK_OFF as u64, &[0u8])
+            .map_err(|_| format!("écriture join_ok refusée (code {})", last_error()))?;
+        write_exact(process, cave as u64 + INJECT_JOIN_NO_PEER_OFF as u64, &[0u8])
+            .map_err(|_| format!("écriture no_peer refusée (code {})", last_error()))?;
     }
     Ok(())
 }
@@ -1527,9 +1753,19 @@ fn refresh_discover_inject_packet(
     write_exact(process, cave as u64, &code).map_err(|_| {
         format!("réécriture stub inject refusée (code {})", last_error())
     })?;
-    write_inject_packet_blobs(process, cave, lobby, true)?;
+    write_inject_packet_blobs(process, cave, image, lobby, true)?;
+    let native = build_native_mp_set_stub(cave, image);
+    write_exact(
+        process,
+        cave as u64 + INJECT_NATIVE_SET_STUB_OFF as u64,
+        &native,
+    )
+    .map_err(|_| format!("réécriture native_set stub refusée (code {})", last_error()))?;
     install_search_enter_flag_hook(process, image, cave)?;
     install_join_arm_hook(process, image, cave)?;
+    let _ = install_level_map_index_hook(process, image, cave);
+    let _ = apply_mp_selection_to_game(process, image, lobby);
+    let _ = write_forced_map_to_cave(process, image, cave, lobby);
     Ok(true)
 }
 
@@ -1555,9 +1791,23 @@ fn build_select_inject_stub(
     let join_lens_abs = page + INJECT_JOIN_LENS_OFF;
     let disc_pkt_abs = page + INJECT_DISCOVER_PKT_OFF;
     let join_base_abs = page + INJECT_JOIN_PKT_BASE;
+    let native_arm_abs = page + INJECT_NATIVE_ARM_OFF;
+    let native_stub_abs = page + INJECT_NATIVE_SET_STUB_OFF;
     let ip_imm = u32::from_le_bytes(lan);
 
     let mut code: Vec<u8> = Vec::with_capacity(320);
+    // One-shot native SetMPGameMode/SetMPLevel avant drain file.
+    code.extend_from_slice(&[0x80, 0x3D]);
+    code.extend_from_slice(&native_arm_abs.to_le_bytes());
+    code.push(0x00); // cmp byte [NATIVE_ARM],0
+    let je_no_native = code.len();
+    code.extend_from_slice(&[0x74, 0x00]); // je skip_native
+    let call_native_at = code.len();
+    code.extend_from_slice(&[0xE8, 0, 0, 0, 0]); // call native_set_stub
+    let skip_native = code.len();
+    code[je_no_native + 1] =
+        (skip_native as isize - (je_no_native as isize + 2)) as u8;
+
     // Force inject : MODE==1 && IDX<COUNT → on saute le `jg go_recv` même si
     // select>0 (en jeu, le socket est lisible : loopback LAN / trafic natif),
     // sinon la file join/phase B n'est jamais drainée (hits/idx/join_ok figés).
@@ -1717,6 +1967,7 @@ fn build_select_inject_stub(
     };
     patch_e8(&mut code, call_e310_at, LOOKUP_RVA);
     patch_e8(&mut code, call_e370_at, DISPATCH_RVA);
+    patch_rel32(&mut code, call_native_at + 1, page, native_stub_abs);
     patch_rel32(&mut code, jmp_exit_after_join_at + 1, page, image + EXIT_RVA);
     patch_rel32(&mut code, jmp_exit_retry_at + 1, page, image + EXIT_RVA);
     patch_rel32(&mut code, jmp_parse_at + 1, page, image + PARSE_RVA);
@@ -1736,6 +1987,9 @@ fn build_select_inject_stub(
 /// Si le jeu tourne déjà avec le hook discover : maj paquet + flag=0.
 #[cfg(windows)]
 fn sync_lobby_inject_live(lobby: &LobbyConfig) -> Result<String, String> {
+    if inject_join_active() {
+        return Ok("lobby frozen (join in progress)".into());
+    }
     let Some(pid) = find_game_pid() else {
         return Ok("jeu non lancé".into());
     };
@@ -1762,12 +2016,34 @@ fn sync_lobby_inject_live(lobby: &LobbyConfig) -> Result<String, String> {
     if read_exact(process.0, peb32 + 8, &mut image).is_err() || image == 0 {
         return Ok(format!("image pid={pid} indisponible"));
     }
+    let name = lobby_02_name_bytes(lobby, 1);
+    let title = level_title_idx(lobby.game_mode, lobby.map_id);
+    let load = level_load_idx(lobby.game_mode, lobby.map_id);
+    let name_log = format!(
+        "0x02 name=[{},{},{},{}] load={} title={}(off-wire) retail={} mode={}",
+        name[0],
+        name[1],
+        name[2],
+        name[3],
+        load,
+        title,
+        lobby.map_id,
+        lobby.game_mode
+    );
     match refresh_discover_inject_packet(process.0, image, lobby)? {
-        true => Ok(format!(
-            "inject sync pid={pid} lobby={} mode={} map={}",
-            lobby.host_name, lobby.game_mode, lobby.map_id
-        )),
-        false => Ok(format!("hook inject absent pid={pid}")),
+        true => {
+            let map_msg = apply_mp_selection_to_game(process.0, image, lobby);
+            Ok(format!(
+                "inject sync pid={pid} lobby={} mode={} map={} {name_log} ({map_msg})",
+                lobby.host_name, lobby.game_mode, lobby.map_id
+            ))
+        }
+        false => {
+            let map_msg = apply_mp_selection_to_game(process.0, image, lobby);
+            Ok(format!(
+                "hook inject absent pid={pid}; {name_log}; {map_msg}"
+            ))
+        }
     }
 }
 
@@ -1777,7 +2053,7 @@ fn sync_lobby_inject_live(_lobby: &LobbyConfig) -> Result<String, String> {
 }
 
 /// Sans datagramme UWP, select (FUN_004e0430) rend ≤0 et sort avant recv.
-/// File : MODE0=discover 0x02 ; MODE1=join 0x05→0x16→0x10→0x06→0x08→0x12.
+/// File : MODE0=discover 0x02 ; MODE1=join A1=0x05+ACK → MapIdx → A2=0x10 → 0x06→0x08→0x12.
 #[cfg(windows)]
 /// Rel32 depuis l'octet suivant une instruction E8/E9.
 #[cfg(windows)]
@@ -1930,6 +2206,17 @@ fn remote_proc_address(
     Err(format!("export {export_name} introuvable"))
 }
 
+/// Store build : pas de `l_madagascar.gla` ; meshes/textures Mad sont dans
+/// `l_siberia.gla`. Hook CreateFileW : `…\l_madagascar.gla` → `…\l_siberia.gla`
+/// (ignore `l_madagascar_small.gla`).
+#[cfg(windows)]
+fn install_madagascar_gla_redirect(_process: *mut std::ffi::c_void) -> String {
+    // Hook CreateFileW (kernel32) désactivé : plantait sur l'écran Gameloft
+    // (posé trop tôt via open_menu_sections / apply_mp). Réactiver seulement
+    // avec un IAT-hook ciblé jeu, jamais un patch prologue global.
+    "gla-redirect=disabled".into()
+}
+
 /// pid + image base (ASLR).
 #[cfg(windows)]
 static FPS_LOOK_STATE: Mutex<Option<(u32, u32)>> = Mutex::new(None);
@@ -1940,6 +2227,28 @@ static FPS_RAW_DX: AtomicI32 = AtomicI32::new(0);
 #[cfg(windows)]
 static FPS_RAW_DY: AtomicI32 = AtomicI32::new(0);
 
+/// Échelle packer °/raw (défaut 0.06). Bits f32 via AtomicU32.
+#[cfg(windows)]
+static LOOK_SENS_BITS: AtomicU32 = AtomicU32::new(u32::from_le_bytes(0.06f32.to_le_bytes()));
+/// false jusqu'au 0x11 *post*-0x10 : freelook mid-load / 0x11 stale crash le client.
+static FREELOOK_AFTER_LOAD: AtomicBool = AtomicBool::new(false);
+
+const LOOK_BASE_SCALE: f32 = 0.06;
+
+fn look_scale_from_mult(mult: f32) -> f32 {
+    (LOOK_BASE_SCALE * mult.clamp(0.25, 3.0)).clamp(0.015, 0.18)
+}
+
+#[tauri::command]
+fn set_look_settings(sensitivity: f32) {
+    let scale = look_scale_from_mult(sensitivity);
+    #[cfg(windows)]
+    {
+        LOOK_SENS_BITS.store(scale.to_bits(), Ordering::Relaxed);
+    }
+    let _ = (sensitivity, scale);
+}
+
 #[cfg(windows)]
 fn read_u32_at(process: *mut std::ffi::c_void, addr: u64) -> Option<u32> {
     let mut b = [0u8; 4];
@@ -1947,6 +2256,860 @@ fn read_u32_at(process: *mut std::ffi::c_void, addr: u64) -> Option<u32> {
         return None;
     }
     Some(u32::from_le_bytes(b))
+}
+
+/// MSVC x86 `std::string` (SSO si capacity < 16) — layout de `entry+0x64` / a550 name.
+#[cfg(windows)]
+fn read_msvc_string(process: *mut std::ffi::c_void, addr: u64) -> Option<String> {
+    let mut head = [0u8; 0x18];
+    read_bytes(process, addr, &mut head).ok()?;
+    let size = u32::from_le_bytes(head[0x10..0x14].try_into().ok()?) as usize;
+    let cap = u32::from_le_bytes(head[0x14..0x18].try_into().ok()?) as usize;
+    if size > 0x200 {
+        return None;
+    }
+    let bytes = if cap < 16 {
+        head[..size.min(15)].to_vec()
+    } else {
+        let ptr = u32::from_le_bytes(head[0..4].try_into().ok()?);
+        if ptr < 0x10000 {
+            return None;
+        }
+        let mut buf = vec![0u8; size];
+        read_bytes(process, ptr as u64, &mut buf).ok()?;
+        buf
+    };
+    let s = String::from_utf8_lossy(&bytes)
+        .trim_matches(char::from(0))
+        .to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+fn normalize_map_name(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_')
+        .flat_map(|c| c.to_uppercase())
+        .collect()
+}
+
+/// Cartes autorisées par mode (même matrice que `maps-modes.json` / `wireMapIndex`).
+fn maps_by_mode(mode: u8) -> &'static [u8] {
+    match mode {
+        // Madagascar (idx 9) CTD — hors UI.
+        // TDM/FFA : Cath/Ruines CTD au stream (GameMode 2/3) — Fort/Quais/Crash OK.
+        0 => &[0, 2, 4, 5],
+        1 => &[0, 2, 3, 5],
+        2 => &[3, 4, 5],
+        3 => &[3, 5],
+        _ => &[0, 2, 4, 5],
+    }
+}
+
+/// Index mode-local pour `0x02 name[3]` (liste serveurs) — pas l'index table 33.
+fn wire_map_index(mode: u8, map_id: u8) -> u8 {
+    let allowed = maps_by_mode(mode);
+    allowed
+        .iter()
+        .position(|&m| m == map_id)
+        .unwrap_or(0) as u8
+}
+
+/// Cellule mode×carte — miroir de `maps-modes.json` → `levelPlans`.
+/// `alias_from` : donor table (assets) avant 0x10 ; None = entrée native.
+/// `stream_mode` : GameMode écrit au load (Store : TDM=2 CTD → stream en FFA=3).
+#[derive(Clone, Copy, Debug)]
+struct LevelPlan {
+    title: u8,
+    load: u8,
+    alias_from: Option<u8>,
+    stream_mode: Option<u8>,
+}
+
+/// Plan niveau **par (mode, map)** — pas de branche globale CTF/Dom.
+/// Une case cassée se corrige sans toucher les autres modes.
+fn level_plan(mode: u8, map_id: u8) -> LevelPlan {
+    let p = |title: u8, load: u8| LevelPlan {
+        title,
+        load,
+        alias_from: None,
+        stream_mode: None,
+    };
+    let ps = |title: u8, load: u8, stream: u8| LevelPlan {
+        title,
+        load,
+        alias_from: None,
+        stream_mode: Some(stream),
+    };
+    match (mode, map_id) {
+        // —— Domination ——
+        (0, 0) => p(0, 0),
+        (0, 2) => p(3, 12),
+        (0, 4) => p(5, 5),
+        (0, 5) => p(4, 4),
+        // —— CTF : Cath/Ruines = load Dom (idx 1/13 CTD Store) ; Quais/Crash natifs ——
+        (1, 0) => p(1, 0),
+        (1, 2) => p(13, 12),
+        (1, 3) => p(11, 11),
+        (1, 5) => p(4, 4),
+        // —— Match à mort : GameMode=2 CTD Store.
+        // Quais : **10** = MALTA_SMALL (pas 2→Fort Dom, pas 11→CTF CTD).
+        // Fort : stream Dom (0) — Fort@Dom OK. Quais/Crash : stream FFA (3).
+        (2, 3) => ps(10, 10, 3),
+        (2, 4) => ps(5, 5, 0),
+        (2, 5) => ps(4, 4, 3),
+        // —— Chacun pour soi ——
+        (3, 3) => p(10, 10),
+        (3, 5) => p(4, 4),
+        // Hors matrice — ne pas forcer un load CTF.
+        _ => p(map_id, map_id),
+    }
+}
+
+fn level_title_idx(mode: u8, map_id: u8) -> u8 {
+    level_plan(mode, map_id).title
+}
+
+fn level_load_idx(mode: u8, map_id: u8) -> u8 {
+    level_plan(mode, map_id).load
+}
+
+fn level_alias_from(mode: u8, map_id: u8) -> Option<u8> {
+    level_plan(mode, map_id).alias_from
+}
+
+/// GameMode réellement poussé au client pendant le load (≠ label lobby si stream_mode).
+fn level_stream_mode(mode: u8, map_id: u8) -> u8 {
+    level_plan(mode, map_id)
+        .stream_mode
+        .unwrap_or(mode)
+}
+
+/// Index table pour MapIdx / 0x10 (stream jouable).
+fn retail_to_level_idx(mode: u8, map_id: u8) -> u8 {
+    level_load_idx(mode, map_id)
+}
+
+/// String ids +0x60 d'origine (dump table 33) — le spoof titre les écrasait
+/// et le stream suivait le sid → Quais / crash. On restaure avant load.
+/// Idx CTF fragiles (1/13) : sid Dom du donor après alias assets.
+#[cfg(windows)]
+fn pristine_level_sid(load_idx: u8) -> Option<u32> {
+    match load_idx {
+        0 | 1 => Some(0xdd6), // CATHEDRAL (+ CTF aliasé)
+        2 | 10 => Some(0x85f), // MALTA_SMALL (Quais ; 10 = doublon anti-Fort)
+        3 | 12 | 13 => Some(0xd84), // MADAGASCAR_SMALL (+ CTF aliasé)
+        4 => Some(0xdd5),     // UFO_CTF
+        5 | 14 => Some(0x85d), // MALTA (Fort)
+        6 => Some(0xdd8),     // MALTA_CTF
+        11 => Some(0xddb),    // MALTA_SMALL_CTF
+        _ => None,
+    }
+}
+
+/// Copie l'entrée `donor` → `dst` (0x84) en préservant le nom `FPS_LEVEL_*`
+/// dst (+0x64). Uniquement pour la cellule mode×carte qui a `aliasFrom`
+/// (n'altère jamais le donor Dom utilisé par les autres modes).
+#[cfg(windows)]
+fn alias_level_entry_assets(
+    process: *mut std::ffi::c_void,
+    image: u32,
+    dst: u8,
+    donor: u8,
+) -> String {
+    if donor == dst {
+        return "alias=same".into();
+    }
+    const LVL_RVA: u32 = 0x9A4624;
+    let Some(lvl) = read_u32_at(process, image as u64 + LVL_RVA as u64) else {
+        return "alias=no-lvl".into();
+    };
+    let Some(begin) = read_u32_at(process, lvl as u64 + 0x10) else {
+        return "alias=no-begin".into();
+    };
+    let Some(end) = read_u32_at(process, lvl as u64 + 0x14) else {
+        return "alias=no-end".into();
+    };
+    if end <= begin || begin < 0x10000 {
+        return "alias=bad-range".into();
+    }
+    let count = (end - begin) / 0x84;
+    if (dst as u32) >= count || (donor as u32) >= count {
+        return format!("alias=oob dst={dst} donor={donor} count={count}");
+    }
+    let dst_addr = begin as u64 + (dst as u64) * 0x84;
+    let donor_addr = begin as u64 + (donor as u64) * 0x84;
+
+    let mut saved_name = [0u8; 0x18];
+    if read_bytes(process, dst_addr + 0x64, &mut saved_name).is_err() {
+        return "alias=read-name-ko".into();
+    }
+    let mut donor_entry = [0u8; 0x84];
+    if read_bytes(process, donor_addr, &mut donor_entry).is_err() {
+        return "alias=read-donor-ko".into();
+    }
+    if write_exact(process, dst_addr, &donor_entry).is_err() {
+        return "alias=write-entry-ko".into();
+    }
+    if write_exact(process, dst_addr + 0x64, &saved_name).is_err() {
+        return "alias=restore-name-ko".into();
+    }
+    if let Some(sid) = pristine_level_sid(donor) {
+        let _ = write_exact(process, dst_addr + 0x60, &sid.to_le_bytes());
+    }
+    format!("alias dst={dst}←{donor}")
+}
+
+/// Restaure `load_idx+0x60` au sid d'origine (annule un ancien title-spoof).
+#[cfg(windows)]
+fn restore_load_entry_sid(
+    process: *mut std::ffi::c_void,
+    image: u32,
+    load_idx: u8,
+) -> String {
+    let Some(want) = pristine_level_sid(load_idx) else {
+        return "sid-restore=n/a".into();
+    };
+    const LVL_RVA: u32 = 0x9A4624;
+    let Some(lvl) = read_u32_at(process, image as u64 + LVL_RVA as u64) else {
+        return "sid-restore=no-lvl".into();
+    };
+    let Some(begin) = read_u32_at(process, lvl as u64 + 0x10) else {
+        return "sid-restore=no-begin".into();
+    };
+    let Some(end) = read_u32_at(process, lvl as u64 + 0x14) else {
+        return "sid-restore=no-end".into();
+    };
+    if end <= begin || begin < 0x10000 {
+        return "sid-restore=bad-range".into();
+    }
+    let count = (end - begin) / 0x84;
+    if (load_idx as u32) >= count {
+        return format!("sid-restore=oob load={load_idx} count={count}");
+    }
+    let dst = begin as u64 + (load_idx as u64) * 0x84 + 0x60;
+    let cur = read_u32_at(process, dst).unwrap_or(0);
+    if cur == want {
+        return format!("sid-restore=ok load={load_idx} sid=0x{want:x}");
+    }
+    if write_exact(process, dst, &want.to_le_bytes()).is_err() {
+        return "sid-restore=write-ko".into();
+    }
+    format!("sid-restore load={load_idx} 0x{cur:x}→0x{want:x}")
+}
+
+/// Token `FPS_LEVEL_*` attendu pour l'index **load** (pas le titre CTF).
+/// Évite un rescan qui « upgrade » load Dom → entrée *_CTF (CTD).
+fn expected_level_token(mode: u8, map_id: u8) -> &'static str {
+    token_for_load_idx(level_load_idx(mode, map_id))
+}
+
+fn token_for_load_idx(load_idx: u8) -> &'static str {
+    match load_idx {
+        0 => "CATHEDRAL",
+        1 => "CATHEDRAL_CTF",
+        2 | 10 => "MALTA_SMALL", // 10 = doublon Quais (évite name[3]=2 → Fort)
+        3 | 12 => "MADAGASCAR_SMALL",
+        4 => "UFO",
+        5 | 14 => "MALTA",
+        6 => "MALTA_CTF",
+        9 => "MADAGASCAR_CTF",
+        11 => "MALTA_SMALL_CTF",
+        13 => "MADAGASCAR_SMALL_CTF",
+        _ => "",
+    }
+}
+
+/// Match sur nom `FPS_LEVEL_*` — aligné sur le **load** de la matrice.
+fn fps_level_name_matches(name: &str, mode: u8, map_id: u8) -> bool {
+    let token = expected_level_token(mode, map_id);
+    fps_level_name_matches_token(name, token)
+}
+
+fn fps_level_name_matches_token(name: &str, token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    let n = normalize_map_name(name);
+    let t = normalize_map_name(token);
+    let token_ctf = t.contains("CTF");
+    let name_ctf = n.contains("CTF");
+    if token_ctf != name_ctf {
+        return false;
+    }
+    if n.contains(&t) {
+        // Éviter MALTA matchant MALTA_SMALL quand on cherche Fort.
+        if t == "MALTA" && n.contains("SMALL") {
+            return false;
+        }
+        if t == "MALTA" && n.contains("MEDIUM") {
+            return false;
+        }
+        // Titre Madagascar (idx 9) ≠ MADAGASCAR_SMALL (idx 3).
+        if t == "MADAGASCAR" && n.contains("SMALL") {
+            return false;
+        }
+        return true;
+    }
+    false
+}
+
+#[cfg(windows)]
+fn read_a550_map_name(
+    process: *mut std::ffi::c_void,
+    image: u32,
+    mode: u8,
+    map_id: u8,
+) -> Option<String> {
+    const MP_RVA: u32 = 0x9A42DC;
+    let mp = read_u32_at(process, image as u64 + MP_RVA as u64)?;
+    if mp < 0x10000 {
+        return None;
+    }
+    let modes = read_u32_at(process, mp as u64 + 0xA550)?;
+    if modes < 0x10000 {
+        return None;
+    }
+    let begin = read_u32_at(process, modes as u64 + 0x4)?;
+    let end = read_u32_at(process, modes as u64 + 0x8)?;
+    if end <= begin {
+        return None;
+    }
+    let mode_count = (end - begin) / 0x50;
+    if (mode as u32) >= mode_count {
+        return None;
+    }
+    let mode_entry = begin as u64 + (mode as u64) * 0x50;
+    let maps_begin = read_u32_at(process, mode_entry + 0x44)?;
+    let maps_end = read_u32_at(process, mode_entry + 0x48)?;
+    if maps_end <= maps_begin || maps_begin < 0x10000 {
+        return None;
+    }
+    let map_count = (maps_end - maps_begin) / 0x48;
+    for i in 0..map_count {
+        let entry = maps_begin as u64 + (i as u64) * 0x48;
+        let abs = read_u32_at(process, entry + 0x4).unwrap_or(0xFFFF);
+        if abs != map_id as u32 {
+            continue;
+        }
+        return read_msvc_string(process, entry + 0x8);
+    }
+    None
+}
+
+/// Scan live table 0..count pour le 1er `entry+0x64` qui match le token / règles FPS.
+#[cfg(windows)]
+fn scan_level_table_for_map(
+    process: *mut std::ffi::c_void,
+    begin: u32,
+    count: u32,
+    mode: u8,
+    map_id: u8,
+) -> Option<(u8, String)> {
+    let token = expected_level_token(mode, map_id);
+    // Passe 1 : token exact.
+    for i in 0..count {
+        let entry = begin as u64 + (i as u64) * 0x84;
+        let Some(name) = read_msvc_string(process, entry + 0x64) else {
+            continue;
+        };
+        if fps_level_name_matches_token(&name, token) {
+            return Some((i as u8, name));
+        }
+    }
+    // Passe 2 : règles FPS mode-aware.
+    for i in 0..count {
+        let entry = begin as u64 + (i as u64) * 0x84;
+        let Some(name) = read_msvc_string(process, entry + 0x64) else {
+            continue;
+        };
+        if fps_level_name_matches(&name, mode, map_id) {
+            return Some((i as u8, name));
+        }
+    }
+    None
+}
+
+/// MapIdx = index dans la table à 33 (`FUN_006d3aa0`), **pas** l'id retail 0..5.
+/// 1) table statique mode×map  2) validation / rescan tokens FPS_LEVEL_*
+#[cfg(windows)]
+fn resolve_level_table_idx(
+    process: *mut std::ffi::c_void,
+    image: u32,
+    mode: u8,
+    map_id: u8,
+) -> Option<(u8, String)> {
+    const LVL_RVA: u32 = 0x9A4624;
+    let candidate = retail_to_level_idx(mode, map_id);
+    let token = expected_level_token(mode, map_id);
+
+    let lvl = read_u32_at(process, image as u64 + LVL_RVA as u64)?;
+    if lvl < 0x10000 {
+        return Some((candidate, format!("static:{token}")));
+    }
+    let begin = read_u32_at(process, lvl as u64 + 0x10)?;
+    let end = read_u32_at(process, lvl as u64 + 0x14)?;
+    if end <= begin || begin < 0x10000 {
+        return Some((candidate, format!("static:{token}")));
+    }
+    let count = ((end - begin) / 0x84).min(64);
+
+    // 1) Toujours suivre la matrice `load` si l'entrée existe.
+    //    Ne pas rescan→*_CTF (upgrade Dom 12→13 / Cath 0→1 = CTD Store).
+    if (candidate as u32) < count {
+        let name = read_msvc_string(
+            process,
+            begin as u64 + (candidate as u64) * 0x84 + 0x64,
+        )
+        .unwrap_or_default();
+        let label = if name.is_empty() {
+            format!("static:{token}")
+        } else {
+            name
+        };
+        return Some((candidate, label));
+    }
+
+    // 2) OOB seulement : rescan / fallback.
+    if let Some(hit) = scan_level_table_for_map(process, begin, count, mode, map_id) {
+        return Some(hit);
+    }
+    Some((candidate, format!("static-fallback:{token}")))
+}
+
+/// Résolution offline (stub / lobby-live sans process) — même table statique.
+fn resolve_level_table_idx_static(mode: u8, map_id: u8) -> u8 {
+    retail_to_level_idx(mode, map_id)
+}
+
+/// Force mode/carte : load_idx dans menu+0x58 et mp+0x3100 (SetMPLevel natif).
+/// Liste/Select = 0x02 name[0]=name[3]=load. Pas de spoof +0x60 sur l'entrée
+/// load (sid corrompu → stream Quais). On restaure le sid d'origine si besoin.
+#[cfg(windows)]
+fn apply_mp_selection_to_game(
+    process: *mut std::ffi::c_void,
+    image: u32,
+    lobby: &LobbyConfig,
+) -> String {
+    const MENU_RVA: u32 = 0x9A461C;
+    const MENU_ALT_RVA: u32 = 0x99F3C0;
+    const MP_RVA: u32 = 0x9A42DC;
+    const MODE_OFF: u64 = 0x50;
+    const MAP_OFF: u64 = 0x58;
+    const FLAG_OFF: u64 = 0x5F;
+    const MP_MODE_OFF: u64 = 0x30FC;
+    const MP_MAP_OFF: u64 = 0x3100;
+
+    let mode = level_stream_mode(lobby.game_mode, lobby.map_id) as u32;
+    let title_idx = level_title_idx(lobby.game_mode, lobby.map_id);
+    let (table_idx, resolved) = match resolve_level_table_idx(
+        process,
+        image,
+        lobby.game_mode,
+        lobby.map_id,
+    ) {
+        Some((idx, name)) => (idx as u32, format!("{idx}:{name}")),
+        None => {
+            let idx = resolve_level_table_idx_static(lobby.game_mode, lobby.map_id);
+            (idx as u32, format!("static:{idx}"))
+        }
+    };
+    // Alias assets seulement si la cellule (mode, map) le demande — pas sur
+    // le seul load_idx (évite de pourrir Dom/TDM après un CTF).
+    let alias_msg = match level_alias_from(lobby.game_mode, lobby.map_id) {
+        Some(donor) => {
+            alias_level_entry_assets(process, image, table_idx as u8, donor)
+        }
+        None => "alias=n/a".into(),
+    };
+    let sid_msg = restore_load_entry_sid(process, image, table_idx as u8);
+    let gla_msg = install_madagascar_gla_redirect(process);
+    let mut wrote = 0u32;
+    let mut rb_mode = None;
+    let mut rb_map = None;
+    for rva in [MENU_RVA, MENU_ALT_RVA] {
+        let Some(obj) = read_u32_at(process, image as u64 + rva as u64) else {
+            continue;
+        };
+        if obj < 0x10000 || (obj & 3) != 0 {
+            continue;
+        }
+        let mode_ok = write_exact(process, obj as u64 + MODE_OFF, &mode.to_le_bytes()).is_ok();
+        // SetMPLevel : même index table que mp+0x3100 (pas retail).
+        let map_ok = write_exact(process, obj as u64 + MAP_OFF, &table_idx.to_le_bytes()).is_ok();
+        let _ = write_exact(process, obj as u64 + FLAG_OFF, &[1u8]);
+        if mode_ok && map_ok {
+            wrote += 1;
+            if rb_mode.is_none() {
+                rb_mode = read_u32_at(process, obj as u64 + MODE_OFF);
+                rb_map = read_u32_at(process, obj as u64 + MAP_OFF);
+            }
+        }
+    }
+    let mut mp_ok = 0u32;
+    if let Some(mp) = read_u32_at(process, image as u64 + MP_RVA as u64) {
+        if mp >= 0x10000 && (mp & 3) == 0 {
+            if write_exact(process, mp as u64 + MP_MODE_OFF, &mode.to_le_bytes()).is_ok() {
+                mp_ok += 1;
+            }
+            if write_exact(process, mp as u64 + MP_MAP_OFF, &table_idx.to_le_bytes()).is_ok() {
+                mp_ok += 1;
+            }
+        }
+    }
+    format!(
+        "GameMode={} streamMode={} MapIdx={} title={} retail={} resolved={} writes={} mp={} rb=({},{}) {} {} {}",
+        lobby.game_mode,
+        mode,
+        table_idx,
+        title_idx,
+        lobby.map_id,
+        resolved,
+        wrote,
+        mp_ok,
+        rb_mode.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+        rb_map.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+        alias_msg,
+        sid_msg,
+        gla_msg
+    )
+}
+
+/// Remettre le GameMode lobby après un stream de secours (TDM→FFA).
+/// Ne pas appeler avant ClassSelect (CTD observé).
+#[cfg(windows)]
+#[allow(dead_code)]
+fn restore_lobby_game_mode_after_load(
+    process: *mut std::ffi::c_void,
+    image: u32,
+    lobby: &LobbyConfig,
+) -> String {
+    let want = lobby.game_mode;
+    let streamed = level_stream_mode(lobby.game_mode, lobby.map_id);
+    if want == streamed {
+        return "mode-restore=n/a".into();
+    }
+    const MENU_RVA: u32 = 0x9A461C;
+    const MENU_ALT_RVA: u32 = 0x99F3C0;
+    const MP_RVA: u32 = 0x9A42DC;
+    let mode_u32 = want as u32;
+    let mut n = 0u32;
+    for rva in [MENU_RVA, MENU_ALT_RVA] {
+        if let Some(obj) = read_u32_at(process, image as u64 + rva as u64) {
+            if obj >= 0x10000
+                && (obj & 3) == 0
+                && write_exact(process, obj as u64 + 0x50, &mode_u32.to_le_bytes()).is_ok()
+            {
+                n += 1;
+            }
+        }
+    }
+    if let Some(mp) = read_u32_at(process, image as u64 + MP_RVA as u64) {
+        if mp >= 0x10000
+            && (mp & 3) == 0
+            && write_exact(process, mp as u64 + 0x30FC, &mode_u32.to_le_bytes()).is_ok()
+        {
+            n += 1;
+        }
+    }
+    format!("mode-restore {streamed}→{want} writes={n}")
+}
+
+/// Snapshot table niveaux / a550 / noms juste avant 0x10.
+#[cfg(windows)]
+fn dump_mp_level_state(
+    process: *mut std::ffi::c_void,
+    image: u32,
+    lobby: &LobbyConfig,
+) -> String {
+    const MENU_RVA: u32 = 0x9A461C;
+    const LVL_RVA: u32 = 0x9A4624;
+    const MP_RVA: u32 = 0x9A42DC;
+
+    let menu = read_u32_at(process, image as u64 + MENU_RVA as u64).unwrap_or(0);
+    let (m50, m58, m5f) = if menu >= 0x10000 {
+        (
+            read_u32_at(process, menu as u64 + 0x50).unwrap_or(0),
+            read_u32_at(process, menu as u64 + 0x58).unwrap_or(0),
+            {
+                let mut b = [0u8];
+                let _ = read_bytes(process, menu as u64 + 0x5F, &mut b);
+                b[0]
+            },
+        )
+    } else {
+        (0, 0, 0)
+    };
+
+    let lvl = read_u32_at(process, image as u64 + LVL_RVA as u64).unwrap_or(0);
+    let (begin, end, count) = if lvl >= 0x10000 {
+        let begin = read_u32_at(process, lvl as u64 + 0x10).unwrap_or(0);
+        let end = read_u32_at(process, lvl as u64 + 0x14).unwrap_or(0);
+        let count = if end > begin {
+            (end - begin) / 0x84
+        } else {
+            0
+        };
+        (begin, end, count)
+    } else {
+        (0, 0, 0)
+    };
+
+    let resolved = resolve_level_table_idx(process, image, lobby.game_mode, lobby.map_id);
+    let map_idx = resolved
+        .as_ref()
+        .map(|(i, _)| *i as u32)
+        .unwrap_or_else(|| {
+            resolve_level_table_idx_static(lobby.game_mode, lobby.map_id) as u32
+        });
+    let entry60 = if begin >= 0x10000 && map_idx < count {
+        read_u32_at(process, begin as u64 + (map_idx as u64) * 0x84 + 0x60).unwrap_or(0)
+    } else {
+        0
+    };
+    let entry_name = if begin >= 0x10000 && map_idx < count {
+        read_msvc_string(process, begin as u64 + (map_idx as u64) * 0x84 + 0x64)
+            .unwrap_or_else(|| "-".into())
+    } else {
+        "-".into()
+    };
+
+    let mut table_names = String::new();
+    if begin >= 0x10000 && count > 0 {
+        for i in 0..count.min(40) {
+            let e = begin as u64 + (i as u64) * 0x84;
+            let id60 = read_u32_at(process, e + 0x60).unwrap_or(0);
+            let nm = read_msvc_string(process, e + 0x64).unwrap_or_default();
+            if !table_names.is_empty() {
+                table_names.push(';');
+            }
+            table_names.push_str(&format!("{i}:{id60:x}:{nm}"));
+        }
+    }
+
+    // Hex dump entrées clés (0/4/5/9/12/13) pour diag CTD idx 9/13.
+    let mut entry_hex = String::new();
+    if begin >= 0x10000 {
+        for &i in &[0u32, 4, 5, 9, 12, 13] {
+            if i >= count {
+                continue;
+            }
+            let mut block = [0u8; 0x84];
+            let e = begin as u64 + (i as u64) * 0x84;
+            if read_bytes(process, e, &mut block).is_err() {
+                continue;
+            }
+            if !entry_hex.is_empty() {
+                entry_hex.push(' ');
+            }
+            entry_hex.push_str(&format!("e{i}="));
+            for (k, b) in block.iter().enumerate() {
+                if k > 0 && k % 16 == 0 {
+                    entry_hex.push('_');
+                }
+                entry_hex.push_str(&format!("{b:02x}"));
+            }
+        }
+    }
+
+    let a550_name =
+        read_a550_map_name(process, image, lobby.game_mode, lobby.map_id).unwrap_or_default();
+
+    let mp = read_u32_at(process, image as u64 + MP_RVA as u64).unwrap_or(0);
+    let (a550, mp_mode, mp_map) = if mp >= 0x10000 {
+        (
+            read_u32_at(process, mp as u64 + 0xA550).unwrap_or(0),
+            read_u32_at(process, mp as u64 + 0x30FC).unwrap_or(0),
+            read_u32_at(process, mp as u64 + 0x3100).unwrap_or(0),
+        )
+    } else {
+        (0, 0, 0)
+    };
+
+    format!(
+        "level_dump: want=mode{}map{} → idx={} name='{}' a550='{}' menu=({:#x},+50={},+58={},+5f={}) lvl={:#x} begin={:#x} end={:#x} count={} entry60={:#x} mp={:#x} a550={:#x} mpMode={} mpMap={} table=[{}] hex=[{}]",
+        lobby.game_mode,
+        lobby.map_id,
+        map_idx,
+        entry_name,
+        a550_name,
+        menu,
+        m50,
+        m58,
+        m5f,
+        lvl,
+        begin,
+        end,
+        count,
+        entry60,
+        mp,
+        a550,
+        mp_mode,
+        mp_map,
+        table_names,
+        entry_hex
+    )
+}
+
+#[cfg(windows)]
+fn mp_selection_write_count(msg: &str) -> u32 {
+    msg.split("writes=")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split(|c: char| !c.is_ascii_digit())
+                .next()
+                .and_then(|n| n.parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+/// Écrit table/mode/retail en cave (hook table off ; native stub lit retail≠table).
+#[cfg(windows)]
+fn write_forced_map_to_cave(
+    process: *mut std::ffi::c_void,
+    image: u32,
+    cave: u32,
+    lobby: &LobbyConfig,
+) -> Result<(), String> {
+    write_forced_map_to_cave_ex(process, image, cave, lobby, false)
+}
+
+#[cfg(windows)]
+fn write_forced_map_to_cave_ex(
+    process: *mut std::ffi::c_void,
+    image: u32,
+    cave: u32,
+    lobby: &LobbyConfig,
+    arm_native: bool,
+) -> Result<(), String> {
+    let map_idx = resolve_level_table_idx(process, image, lobby.game_mode, lobby.map_id)
+        .map(|(i, _)| i)
+        .unwrap_or_else(|| resolve_level_table_idx_static(lobby.game_mode, lobby.map_id));
+    let stream_mode = level_stream_mode(lobby.game_mode, lobby.map_id);
+    let bytes = [
+        map_idx,      // FORCE_MAP → mp+0x3100 + menu+0x58 (load)
+        stream_mode,  // FORCE_MODE (TDM Store → FFA stream)
+        map_idx,      // FORCE_RETAIL slot = load (SetMPLevel unifié)
+        u8::from(arm_native),
+    ];
+    write_exact(
+        process,
+        cave as u64 + INJECT_FORCE_MAP_OFF as u64,
+        &bytes,
+    )
+    .map_err(|_| format!("écriture force_map refusée (code {})", last_error()))
+}
+
+/// Chaîne utile retail avant 0x10 : poke + arme cave (SetLevel + refresh 0x6d3af0).
+#[cfg(windows)]
+fn apply_mp_level_load_target(
+    process: *mut std::ffi::c_void,
+    image: u32,
+    cave: u32,
+    lobby: &LobbyConfig,
+) -> String {
+    let msg = apply_mp_selection_to_game(process, image, lobby);
+    let _ = write_forced_map_to_cave_ex(process, image, cave, lobby, true);
+    // Attendre que le select stub consomme NATIVE_ARM (thread jeu).
+    let deadline = Instant::now() + Duration::from_millis(250);
+    while Instant::now() < deadline {
+        let mut arm = [0u8];
+        if read_bytes(
+            process,
+            cave as u64 + INJECT_NATIVE_ARM_OFF as u64,
+            &mut arm,
+        )
+        .is_ok()
+            && arm[0] == 0
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    let mut arm = [0u8];
+    let _ = read_bytes(
+        process,
+        cave as u64 + INJECT_NATIVE_ARM_OFF as u64,
+        &mut arm,
+    );
+    // Re-poke au cas où le one-shot cave a couru en parallèle.
+    let msg2 = apply_mp_selection_to_game(process, image, lobby);
+    let _ = write_forced_map_to_cave_ex(process, image, cave, lobby, false);
+    format!("{msg} → native_arm={} repoke={msg2}", arm[0])
+}
+
+/// Stub one-shot (thread select) : **écritures mémoire seulement**.
+/// menu+0x58 et mp+0x3100 ← même load table (SetMPLevel natif).
+#[cfg(windows)]
+fn build_native_mp_set_stub(cave: u32, image: u32) -> Vec<u8> {
+    const MENU_RVA: u32 = 0x9A461C;
+    const MP_RVA: u32 = 0x9A42DC;
+
+    let force_map = cave + INJECT_FORCE_MAP_OFF;
+    let force_mode = cave + INJECT_FORCE_MODE_OFF;
+    let native_arm = cave + INJECT_NATIVE_ARM_OFF;
+    let menu_abs = image + MENU_RVA;
+    let mp_abs = image + MP_RVA;
+
+    let mut c: Vec<u8> = Vec::with_capacity(112);
+    c.push(0x60); // pushad
+    c.extend_from_slice(&[0xC6, 0x05]);
+    c.extend_from_slice(&native_arm.to_le_bytes());
+    c.push(0x00); // NATIVE_ARM=0
+
+    // menu = *[da461c]
+    c.push(0xA1);
+    c.extend_from_slice(&menu_abs.to_le_bytes());
+    c.extend_from_slice(&[0x85, 0xC0]);
+    let jz_no_menu = c.len();
+    c.extend_from_slice(&[0x74, 0x00]);
+
+    // [menu+0x50]=mode, [menu+0x58]=load table, [menu+0x5f]=1
+    c.extend_from_slice(&[0x0F, 0xB6, 0x0D]);
+    c.extend_from_slice(&force_mode.to_le_bytes());
+    c.extend_from_slice(&[0x89, 0x48, 0x50]);
+    c.extend_from_slice(&[0x0F, 0xB6, 0x0D]);
+    c.extend_from_slice(&force_map.to_le_bytes());
+    c.extend_from_slice(&[0x89, 0x48, 0x58]);
+    c.extend_from_slice(&[0xC6, 0x40, 0x5F, 0x01]);
+
+    let skip_menu = c.len();
+    c[jz_no_menu + 1] = (skip_menu as isize - (jz_no_menu as isize + 2)) as u8;
+
+    // mp+0x30fc=mode / +0x3100=load table
+    c.push(0xA1);
+    c.extend_from_slice(&mp_abs.to_le_bytes());
+    c.extend_from_slice(&[0x85, 0xC0]);
+    let jz_no_mp = c.len();
+    c.extend_from_slice(&[0x74, 0x00]);
+    c.extend_from_slice(&[0x0F, 0xB6, 0x0D]);
+    c.extend_from_slice(&force_mode.to_le_bytes());
+    c.extend_from_slice(&[0x89, 0x88]);
+    c.extend_from_slice(&0x30FCu32.to_le_bytes());
+    c.extend_from_slice(&[0x0F, 0xB6, 0x0D]);
+    c.extend_from_slice(&force_map.to_le_bytes());
+    c.extend_from_slice(&[0x89, 0x88]);
+    c.extend_from_slice(&0x3100u32.to_le_bytes());
+    let after_mp = c.len();
+    c[jz_no_mp + 1] = (after_mp as isize - (jz_no_mp as isize + 2)) as u8;
+
+    c.push(0x61); // popad
+    c.push(0xC3); // ret
+    c
+}
+
+/// Hook table 0x6d3a50 désactivé : forcer l'index sur tous les accès
+/// (itérations load) provoquait le crash au Rejoindre.
+#[cfg(windows)]
+fn install_level_map_index_hook(
+    _process: *mut std::ffi::c_void,
+    _image: u32,
+    _cave: u32,
+) -> Result<(), String> {
+    Ok(())
 }
 
 /// Joueur local : index packer `mp+0x2EE8` → table `mp+0x30F0`.
@@ -2048,35 +3211,6 @@ fn resolve_packer_angles(process: *mut std::ffi::c_void, image: u32) -> Option<P
 /// Force horizon sur le **vrai** champ packer `*player+0x58` (+ miroir player+0x58).
 #[cfg(windows)]
 #[allow(dead_code)]
-fn force_packer_pitch_horizon(
-    process: *mut std::ffi::c_void,
-    image: u32,
-) -> Option<(PackerAngles, bool, PackerAngles)> {
-    let before = resolve_packer_angles(process, image)?;
-    // Toujours écrire 0 sur obj+0x58 (hold horizon) — le jeu peut réécrire entre ticks.
-    let z = 0f32.to_le_bytes();
-    let ok_obj = write_exact(process, before.obj as u64 + 0x58, &z).is_ok();
-    let ok_pl = write_exact(process, before.player as u64 + 0x58, &z).is_ok();
-    let wrote = ok_obj && ok_pl;
-    let after = resolve_packer_angles(process, image)?;
-    Some((before, wrote, after))
-}
-
-/// Souris → `*player+0x60` yaw (pitch forcé à part). Désarmé : yaw natif.
-#[cfg(windows)]
-#[allow(dead_code)]
-fn apply_packer_yaw_deg(process: *mut std::ffi::c_void, image: u32, dx: i32) -> bool {
-    let Some(a) = resolve_packer_angles(process, image) else {
-        return false;
-    };
-    const SENS: f32 = 0.15;
-    let new_yaw = a.obj_yaw_raw + (dx as f32) * SENS;
-    let y = new_yaw.to_le_bytes();
-    let ok_obj = write_exact(process, a.obj as u64 + 0x60, &y).is_ok();
-    let ok_pl = write_exact(process, a.player as u64 + 0x60, &y).is_ok();
-    ok_obj && ok_pl
-}
-
 /// Fire-look gates — ARM une fois en match FPS, restore à la sortie.
 #[cfg(windows)]
 const FIRE_GATE_JLE_ORIG: [u8; 8] = [0x85, 0xC0, 0x0F, 0x8E, 0x11, 0x01, 0x00, 0x00];
@@ -2200,7 +3334,8 @@ fn restore_abs_look_no_center(process: *mut std::ffi::c_void, image: u32) -> Res
     patch_code(process, image, 0x2E317D, &[0xEB, 0x5F], &[0x74, 0x5F])
 }
 
-/// Masque le stick UI tactile.
+/// Masque le stick UI tactile (look). Ne pas armer en match : casse le sprint
+/// (AnalogJoystick partage IsActive @0x46D070).
 #[cfg(windows)]
 #[allow(dead_code)]
 fn disable_touch_controls(process: *mut std::ffi::c_void, image: u32) -> Result<(), String> {
@@ -4184,18 +5319,47 @@ fn uninstall_freelook_hook(process: *mut std::ffi::c_void, image: u32, page: Opt
     }
 }
 
+const ABS_LOOK_APPLY_RVA: u32 = 0x2E3060;
+
+/// Écrit 1 octet @abs-look apply (VirtualProtect).
+#[cfg(windows)]
+#[allow(dead_code)]
+fn write_abs_look_prologue_byte(
+    process: *mut std::ffi::c_void,
+    image: u32,
+    byte: u8,
+) -> Result<(), String> {
+    let addr = image as u64 + ABS_LOOK_APPLY_RVA as u64;
+    let page = addr & !0xFFF;
+    let mut old = 0u32;
+    if unsafe { VirtualProtectEx(process, page, 0x1000, 0x40, &mut old) } == 0 {
+        return Err(format!("VirtualProtect 2E3060 KO err={}", last_error()));
+    }
+    let wrote = write_exact(process, addr, &[byte]);
+    unsafe { VirtualProtectEx(process, page, 0x1000, old, &mut old) };
+    wrote.map_err(|_| format!("write 2E3060 KO err={}", last_error()))
+}
+
 /// Soft-ret sur apply abs look @0x2E3060. Retourne l'octet d'origine sauvé.
 #[cfg(windows)]
+#[allow(dead_code)]
 fn arm_abs_look_ret_byte(
     process: *mut std::ffi::c_void,
     image: u32,
     saved: &mut Option<u8>,
 ) -> Result<u8, String> {
-    const RVA: u32 = 0x2E3060;
     if let Some(o) = *saved {
+        // Ré-arme le ret si un passage Tab a restauré le prologue.
+        if o != 0xC3 {
+            let addr = image as u64 + ABS_LOOK_APPLY_RVA as u64;
+            let mut cur = [0u8; 1];
+            if read_bytes(process, addr, &mut cur).is_ok() && cur[0] != 0xC3 {
+                let _ = write_abs_look_prologue_byte(process, image, 0xC3);
+            }
+        }
         return Ok(o);
     }
-    let addr = image as u64 + RVA as u64;
+    let addr = image as u64 + ABS_LOOK_APPLY_RVA as u64;
     let mut cur = [0u8; 1];
     if read_bytes(process, addr, &mut cur).is_err() {
         return Err(format!("lecture 2E3060 KO err={}", last_error()));
@@ -4204,14 +5368,7 @@ fn arm_abs_look_ret_byte(
         *saved = Some(0xC3);
         return Ok(0xC3);
     }
-    let page = addr & !0xFFF;
-    let mut old = 0u32;
-    if unsafe { VirtualProtectEx(process, page, 0x1000, 0x40, &mut old) } == 0 {
-        return Err(format!("VirtualProtect 2E3060 KO err={}", last_error()));
-    }
-    let wrote = write_exact(process, addr, &[0xC3]);
-    unsafe { VirtualProtectEx(process, page, 0x1000, old, &mut old) };
-    wrote.map_err(|_| format!("write ret 2E3060 KO err={}", last_error()))?;
+    write_abs_look_prologue_byte(process, image, 0xC3)?;
     *saved = Some(cur[0]);
     Ok(cur[0])
 }
@@ -4226,7 +5383,6 @@ fn spawn_fps_mouse_watcher(app: AppHandle) {
             let mut session_on = false;
             let mut healed = false;
             let mut in_fps = false;
-            let mut session_started_at = std::time::Instant::now();
             let mut hit_log_at = std::time::Instant::now();
             let mut last_fps_check = std::time::Instant::now()
                 .checked_sub(Duration::from_secs(1))
@@ -4235,6 +5391,7 @@ fn spawn_fps_mouse_watcher(app: AppHandle) {
             let mut last_pid_image: Option<(u32, u32)> = None;
             let mut process: *mut std::ffi::c_void = std::ptr::null_mut();
             let mut hwnd_cache: *mut std::ffi::c_void = std::ptr::null_mut();
+            let mut cursor_captured = false;
 
             let close_proc = |process: &mut *mut std::ffi::c_void| {
                 if !process.is_null() {
@@ -4243,16 +5400,24 @@ fn spawn_fps_mouse_watcher(app: AppHandle) {
                 }
             };
 
-            // Probe sol : *player+0x58 → -80 → pitchByte 199. Coupe apply abs @0x2E3060.
-            const ABS_LOOK_APPLY_RVA: u32 = 0x2E3060;
+            // abs@2E3060 natif (Tab). Freelook = packer obj+0x58/60.
+            // Move clavier = 100 % natif (pas de soft-WASD / Idle FSM — lag).
             let mut abs_look_saved: Option<u8> = None;
+            let mut abs_ret_lifted_for_tab = false;
 
             let session_off = |app: &AppHandle,
                                process: *mut std::ffi::c_void,
                                image: u32,
                                on: &mut bool,
                                abs_saved: &mut Option<u8>,
+                               tab_lift: &mut bool,
+                               cursor: &mut bool,
                                reason: &str| {
+                set_game_cursor_captured(std::ptr::null_mut(), false, cursor);
+                unsafe {
+                    ClipCursor(std::ptr::null());
+                }
+                *tab_lift = false;
                 if !*on && abs_saved.is_none() {
                     return;
                 }
@@ -4293,6 +5458,14 @@ fn spawn_fps_mouse_watcher(app: AppHandle) {
                 restore_mgr_look_horizon_hook(process, image);
                 restore_post_6eaee0_horizon(process, image);
                 restore_identity_horizon(process, image);
+                // Annule un ancien disable_touch (cassait le sprint / AnalogJoystick).
+                let _ = patch_code(
+                    process,
+                    image,
+                    0x46D070,
+                    &[0x32, 0xC0, 0xC3, 0x90],
+                    &[0x8A, 0x41, 0x1D, 0xC3],
+                );
                 let site = image as u64 + 0x309D50;
                 let mut cur = [0u8; 6];
                 if read_bytes(process, site, &mut cur).is_ok() && cur[0] == 0xE9 {
@@ -4328,7 +5501,7 @@ fn spawn_fps_mouse_watcher(app: AppHandle) {
             }
 
             if raw_hwnd.is_some() {
-                append_log(&app, "fps-mouse: Raw Input OK (probe mgr+0x108 quat, touch/mgr84 OFF)");
+                append_log(&app, "fps-mouse: Raw Input OK (packer DX/DY + abs@2E3060)");
             } else {
                 append_log(&app, "fps-mouse: Raw Input KO");
             }
@@ -4356,6 +5529,8 @@ fn spawn_fps_mouse_watcher(app: AppHandle) {
                             img,
                             &mut session_on,
                             &mut abs_look_saved,
+                            &mut abs_ret_lifted_for_tab,
+                            &mut cursor_captured,
                             "no-state",
                         );
                     }
@@ -4376,6 +5551,8 @@ fn spawn_fps_mouse_watcher(app: AppHandle) {
                             oi,
                             &mut session_on,
                             &mut abs_look_saved,
+                            &mut abs_ret_lifted_for_tab,
+                            &mut cursor_captured,
                             "pid-change",
                         );
                     }
@@ -4406,6 +5583,8 @@ fn spawn_fps_mouse_watcher(app: AppHandle) {
                             image,
                             &mut session_on,
                             &mut abs_look_saved,
+                            &mut abs_ret_lifted_for_tab,
+                            &mut cursor_captured,
                             "dead",
                         );
                         close_proc(&mut process);
@@ -4424,7 +5603,7 @@ fn spawn_fps_mouse_watcher(app: AppHandle) {
                 if !ready_log {
                     append_log(
                         &app,
-                        "fps-mouse: prêt (probe packer obj58 + ret abs@2E3060)",
+                        "fps-mouse: prêt (probe packer obj58 + ret abs@2E3060, no ClipCursor)",
                     );
                     ready_log = true;
                 }
@@ -4452,20 +5631,26 @@ fn spawn_fps_mouse_watcher(app: AppHandle) {
                 if !fg.is_null() {
                     unsafe { GetWindowThreadProcessId(fg, &mut fg_pid) };
                 }
-                if !(fg_pid == pid || fg == hwnd) {
+                let game_fg = fg_pid == pid || fg == hwnd;
+                if !game_fg {
+                    // Alt-tab / menu OS : garde le ret jusqu'à sortie match.
                     continue;
                 }
 
-                if last_fps_check.elapsed() >= Duration::from_millis(400) {
+                if last_fps_check.elapsed() >= Duration::from_millis(250) {
                     last_fps_check = std::time::Instant::now();
-                    if !match_player_ready(process, image) {
+                    let load_ok = FREELOOK_AFTER_LOAD.load(Ordering::Relaxed);
+                    if !load_ok || !match_player_ready(process, image) {
+                        let reason = if !load_ok { "loading" } else { "player" };
                         session_off(
                             &app,
                             process,
                             image,
                             &mut session_on,
                             &mut abs_look_saved,
-                            "player",
+                            &mut abs_ret_lifted_for_tab,
+                            &mut cursor_captured,
+                            reason,
                         );
                         in_fps = false;
                         healed = false;
@@ -4474,6 +5659,19 @@ fn spawn_fps_mouse_watcher(app: AppHandle) {
                     in_fps = true;
                 }
                 if !in_fps {
+                    continue;
+                }
+                if !FREELOOK_AFTER_LOAD.load(Ordering::Relaxed) {
+                    session_off(
+                        &app,
+                        process,
+                        image,
+                        &mut session_on,
+                        &mut abs_look_saved,
+                        &mut abs_ret_lifted_for_tab,
+                        &mut cursor_captured,
+                        "loading",
+                    );
                     continue;
                 }
 
@@ -4493,89 +5691,59 @@ fn spawn_fps_mouse_watcher(app: AppHandle) {
                     }
                 }
 
-                let _ = write_exact(process, image as u64 + 0x9A4740, &[0u8]);
-
                 if !session_on {
-                    match arm_abs_look_ret_byte(process, image, &mut abs_look_saved) {
-                        Ok(orig) => {
-                            session_on = true;
-                            session_started_at = std::time::Instant::now();
-                            append_log(
-                                &app,
-                                &format!(
-                                    "fps-mouse: freelook ON abs@2E3060 ret (saved=0x{orig:02X}) + packer pitch/yaw DX/DY"
-                                ),
-                            );
-                        }
-                        Err(e) => {
-                            if hit_log_at.elapsed() >= Duration::from_secs(2) {
-                                hit_log_at = std::time::Instant::now();
-                                append_log(&app, &format!("fps-mouse: abs@2E3060 arm KO: {e}"));
-                            }
-                            continue;
-                        }
+                    // Pas de soft-ret @2E3060 ni stomp-skip : les deux ont cassé Tab.
+                    session_on = true;
+                    abs_look_saved = None;
+                    abs_ret_lifted_for_tab = false;
+                    let _ = write_exact(process, image as u64 + 0x9A4740, &[0u8]);
+                    // Annule d'éventuels patches Idle FSM d'une session précédente.
+                    let hard = image.wrapping_add(0x63508).to_le_bytes();
+                    let soft_jt = image.wrapping_add(0x63548).to_le_bytes();
+                    let _ = patch_code(process, image, 0x63634, &soft_jt, &hard);
+                    let _ = patch_code(
+                        process,
+                        image,
+                        0x6354C,
+                        &[0x90, 0x90, 0x90, 0x90, 0x90, 0x90],
+                        &[0x0F, 0x84, 0xB6, 0x00, 0x00, 0x00],
+                    );
+                    let _ = patch_code(
+                        process,
+                        image,
+                        0x63559,
+                        &[0xC7, 0x04, 0x24, 0xCD, 0xCC, 0xCC, 0x3E],
+                        &[0xC7, 0x04, 0x24, 0x00, 0x00, 0x00, 0x00],
+                    );
+                    unsafe {
+                        ClipCursor(std::ptr::null());
                     }
-                }
-
-                // Packer : pitch +0x58 (−80≈sol), yaw +0x60. Scale commun.
-                const PACKER_LOOK_SCALE: f32 = 0.06;
-                const PACKER_PITCH_MIN: f32 = -70.0;
-                const PACKER_PITCH_MAX: f32 = 70.0;
-                const PACKER_PITCH_FLOOR_GUARD: f32 = -75.0;
-                let dx = FPS_RAW_DX.swap(0, Ordering::Relaxed);
-                let dy = FPS_RAW_DY.swap(0, Ordering::Relaxed);
-                let mut pitch_now = f32::NAN;
-                let mut yaw_now = f32::NAN;
-                if let Some(a) = resolve_packer_angles(process, image) {
-                    let mut p = a.obj_pitch_raw;
-                    let mut y = a.obj_yaw_raw;
-                    // Filet anti-sol (stomp résiduel) — pas un lock à 0.
-                    if p < PACKER_PITCH_FLOOR_GUARD {
-                        p = PACKER_PITCH_MIN;
-                    }
-                    if dy != 0 {
-                        // dy>0 souris bas → pitch plus négatif (vers le sol).
-                        p -= dy as f32 * PACKER_LOOK_SCALE;
-                    }
-                    p = p.clamp(PACKER_PITCH_MIN, PACKER_PITCH_MAX);
-                    if dx != 0 {
-                        // dx>0 souris droite → yaw ↓ (convention packer, sens FPS).
-                        y -= dx as f32 * PACKER_LOOK_SCALE;
-                    }
-                    pitch_now = p;
-                    yaw_now = y;
-                    let pb = p.to_le_bytes();
-                    let yb = y.to_le_bytes();
-                    let _ = write_exact(process, a.obj as u64 + 0x58, &pb);
-                    let _ = write_exact(process, a.player as u64 + 0x58, &pb);
-                    let _ = write_exact(process, a.obj as u64 + 0x60, &yb);
-                    let _ = write_exact(process, a.player as u64 + 0x60, &yb);
-                }
-
-                if hit_log_at.elapsed() >= Duration::from_millis(500) {
-                    hit_log_at = std::time::Instant::now();
-                    let uptime_ms = session_started_at.elapsed().as_millis();
-                    let ctl = resolve_fps_camera_ctl(process, image);
-                    let pitch = ctl.and_then(|c| read_f32_at(process, c as u64 + 0x88));
-                    let pack = resolve_packer_angles(process, image);
-                    let pitch_s = match pitch {
-                        Some(p) => format!("ctl88={p:.3}"),
-                        None => "ctl88=?".into(),
-                    };
-                    let pack_s = match pack {
-                        Some(p) => format!(
-                            "obj58={:.2} obj60={:.2} estPitch={} yawByte={}",
-                            p.obj_pitch_raw, p.obj_yaw_raw, p.est_pitch_byte, p.est_yaw_byte
-                        ),
-                        None => "packer=?".into(),
-                    };
+                    set_game_cursor_captured(hwnd, false, &mut cursor_captured);
                     append_log(
                         &app,
-                        &format!(
-                            "fps-mouse: packer tick uptimeMs={uptime_ms} absRet={} dx={dx} dy={dy} wrotePitch={pitch_now:.2} wroteYaw={yaw_now:.2} {pitch_s} {pack_s}",
-                            abs_look_saved.is_some() as u8
-                        ),
+                        "fps-mouse: freelook ON packer DX/DY (abs@2E3060 natif — Tab OK)",
                     );
+                }
+
+                // Packer freelook (souris seulement) — pitch+yaw obj+0x58/60.
+                const PACKER_PITCH_MIN: f32 = -70.0;
+                const PACKER_PITCH_MAX: f32 = 70.0;
+                let scale = f32::from_bits(LOOK_SENS_BITS.load(Ordering::Relaxed));
+                let dx = FPS_RAW_DX.swap(0, Ordering::Relaxed);
+                let dy = FPS_RAW_DY.swap(0, Ordering::Relaxed);
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                if let Some(a) = resolve_packer_angles(process, image) {
+                    if dy != 0 {
+                        let p = (a.obj_pitch_raw - dy as f32 * scale)
+                            .clamp(PACKER_PITCH_MIN, PACKER_PITCH_MAX);
+                        let _ = write_exact(process, a.obj as u64 + 0x58, &p.to_le_bytes());
+                    }
+                    if dx != 0 {
+                        let y = a.obj_yaw_raw - dx as f32 * scale;
+                        let _ = write_exact(process, a.obj as u64 + 0x60, &y.to_le_bytes());
+                    }
                 }
             }
         })
@@ -4815,7 +5983,16 @@ fn install_discover_inject(
     write_exact(process, page as u64, &page_buf).map_err(|_| {
         format!("écriture cave inject refusée (code {})", last_error())
     })?;
-    write_inject_packet_blobs(process, page, lobby, true)?;
+    let native = build_native_mp_set_stub(page, image);
+    write_exact(
+        process,
+        page as u64 + INJECT_NATIVE_SET_STUB_OFF as u64,
+        &native,
+    )
+    .map_err(|_| format!("écriture native_set stub refusée (code {})", last_error()))?;
+    write_inject_packet_blobs(process, page, image, lobby, true)?;
+    let _ = apply_mp_selection_to_game(process, image, lobby);
+    let _ = write_forced_map_to_cave(process, image, page, lobby);
 
     let site = image + SITE_RVA;
     let rel = page.wrapping_sub(site.wrapping_add(5)).to_le_bytes();
@@ -4834,6 +6011,7 @@ fn install_discover_inject(
 
     install_search_enter_flag_hook(process, image, page)?;
     install_join_arm_hook(process, image, page)?;
+    install_level_map_index_hook(process, image, page)?;
     Ok(())
 }
 
@@ -5223,231 +6401,87 @@ extern "system" {
     ) -> u32;
     fn GetModuleHandleW(name: *const u16) -> *mut std::ffi::c_void;
     fn ClientToScreen(hwnd: *mut std::ffi::c_void, pt: *mut i32) -> i32;
-    fn InitializeTouchInjection(max_count: u32, mode: u32) -> i32;
-    fn InjectTouchInput(count: u32, contacts: *const PointerTouchInfo) -> i32;
-    fn CreateSyntheticPointerDevice(
-        pointer_type: u32,
-        max_count: u32,
-        mode: u32,
-    ) -> *mut std::ffi::c_void;
-    fn InjectSyntheticPointerInput(
-        device: *mut std::ffi::c_void,
-        pointer_info: *const PointerTypeInfo,
-        count: u32,
-    ) -> i32;
-    #[allow(dead_code)]
-    fn DestroySyntheticPointerDevice(device: *mut std::ffi::c_void);
+    fn ClipCursor(rect: *const i32) -> i32;
+    fn ShowCursor(show: i32) -> i32;
+    fn GetAsyncKeyState(vkey: i32) -> i16;
 }
 
-/// POINTER_INPUT_TYPE / flags pour InjectTouchInput.
+/// Clip curseur dans le client (sans ShowCursor) — réservé / legacy.
 #[cfg(windows)]
-const PT_TOUCH: u32 = 2;
-#[cfg(windows)]
-const TOUCH_FEEDBACK_DEFAULT: u32 = 0x1;
-#[cfg(windows)]
-const POINTER_FEEDBACK_DEFAULT: u32 = 0x1;
-#[cfg(windows)]
-const POINTER_FLAG_INRANGE: u32 = 0x0000_0002;
-#[cfg(windows)]
-const POINTER_FLAG_INCONTACT: u32 = 0x0000_0004;
-#[cfg(windows)]
-const POINTER_FLAG_PRIMARY: u32 = 0x0000_2000;
-#[cfg(windows)]
-const POINTER_FLAG_DOWN: u32 = 0x0001_0000;
-#[cfg(windows)]
-const POINTER_FLAG_UPDATE: u32 = 0x0002_0000;
-#[cfg(windows)]
-const POINTER_FLAG_UP: u32 = 0x0004_0000;
-#[cfg(windows)]
-const TOUCH_MASK_CONTACTAREA: u32 = 0x1;
-#[cfg(windows)]
-const TOUCH_MASK_ORIENTATION: u32 = 0x2;
-#[cfg(windows)]
-const TOUCH_MASK_PRESSURE: u32 = 0x4;
-/// Doit être < maxCount de InitializeTouchInjection (0 .. max-1).
-#[cfg(windows)]
-const TOUCH_LOOK_POINTER_ID: u32 = 0;
-#[cfg(windows)]
-/// Raw Input → pixels contact. Le look tactile du jeu est déjà très sensible.
-const TOUCH_LOOK_SCALE: f32 = 0.012;
-#[cfg(windows)]
-const TOUCH_LOOK_MAX_STEP: i32 = 1;
-/// Idle → TOUCH_UP (stomp skip+apply armés ; pas de hold permanent = anti force-bas).
-#[cfg(windows)]
-const TOUCH_IDLE_UP_MS: u64 = 120;
-#[cfg(windows)]
-const TOUCH_FLAG_DOWN: u32 =
-    POINTER_FLAG_PRIMARY | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_DOWN;
-#[cfg(windows)]
-const TOUCH_FLAG_UPDATE: u32 =
-    POINTER_FLAG_PRIMARY | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_UPDATE;
-#[cfg(windows)]
-const TOUCH_FLAG_UP: u32 = POINTER_FLAG_PRIMARY | POINTER_FLAG_INRANGE | POINTER_FLAG_UP;
-
-#[cfg(windows)]
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TouchBackend {
-    Inject,
-    Synthetic,
-}
-
-#[cfg(windows)]
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct WinPoint {
-    x: i32,
-    y: i32,
-}
-
-#[cfg(windows)]
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct WinRect {
-    left: i32,
-    top: i32,
-    right: i32,
-    bottom: i32,
-}
-
-#[cfg(windows)]
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct PointerInfo {
-    pointer_type: u32,
-    pointer_id: u32,
-    frame_id: u32,
-    pointer_flags: u32,
-    source_device: *mut std::ffi::c_void,
-    hwnd_target: *mut std::ffi::c_void,
-    pt_pixel: WinPoint,
-    pt_himetric: WinPoint,
-    pt_pixel_raw: WinPoint,
-    pt_himetric_raw: WinPoint,
-    dw_time: u32,
-    history_count: u32,
-    input_data: i32,
-    dw_key_states: u32,
-    performance_count: u64,
-    button_change_type: i32,
-}
-
-#[cfg(windows)]
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct PointerTouchInfo {
-    pointer_info: PointerInfo,
-    touch_flags: u32,
-    touch_mask: u32,
-    rc_contact: WinRect,
-    contact_orientation: u32,
-    pressure: u32,
-}
-
-#[cfg(windows)]
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct PointerTypeInfo {
-    pointer_type: u32,
-    touch_info: PointerTouchInfo,
-}
-
-#[cfg(windows)]
-fn client_to_screen_pt(hwnd: *mut std::ffi::c_void, cx: i32, cy: i32) -> Option<(i32, i32)> {
-    let mut pt = [cx, cy];
-    if unsafe { ClientToScreen(hwnd, pt.as_mut_ptr()) } == 0 {
-        return None;
+#[allow(dead_code)]
+fn set_game_cursor_clipped(
+    hwnd: *mut std::ffi::c_void,
+    want: bool,
+    clipped: &mut bool,
+) {
+    if want == *clipped {
+        return;
     }
-    Some((pt[0], pt[1]))
-}
-
-#[cfg(windows)]
-fn make_pointer_touch_info(
-    hwnd: *mut std::ffi::c_void,
-    screen_x: i32,
-    screen_y: i32,
-    flags: u32,
-) -> PointerTouchInfo {
-    PointerTouchInfo {
-        pointer_info: PointerInfo {
-            pointer_type: PT_TOUCH,
-            pointer_id: TOUCH_LOOK_POINTER_ID,
-            frame_id: 0,
-            pointer_flags: flags,
-            source_device: std::ptr::null_mut(),
-            hwnd_target: hwnd,
-            pt_pixel: WinPoint {
-                x: screen_x,
-                y: screen_y,
-            },
-            pt_himetric: WinPoint { x: 0, y: 0 },
-            pt_pixel_raw: WinPoint {
-                x: screen_x,
-                y: screen_y,
-            },
-            pt_himetric_raw: WinPoint { x: 0, y: 0 },
-            dw_time: 0,
-            history_count: 1,
-            input_data: 0,
-            dw_key_states: 0,
-            performance_count: 0,
-            button_change_type: 0,
-        },
-        touch_flags: 0,
-        touch_mask: TOUCH_MASK_CONTACTAREA | TOUCH_MASK_ORIENTATION | TOUCH_MASK_PRESSURE,
-        rc_contact: WinRect {
-            left: screen_x - 4,
-            top: screen_y - 4,
-            right: screen_x + 4,
-            bottom: screen_y + 4,
-        },
-        contact_orientation: 90,
-        pressure: 512,
-    }
-}
-
-#[cfg(windows)]
-fn inject_touch_contact(
-    hwnd: *mut std::ffi::c_void,
-    screen_x: i32,
-    screen_y: i32,
-    flags: u32,
-) -> bool {
-    let info = make_pointer_touch_info(hwnd, screen_x, screen_y, flags);
-    unsafe { InjectTouchInput(1, &info) != 0 }
-}
-
-#[cfg(windows)]
-fn synthetic_touch_contact(
-    device: *mut std::ffi::c_void,
-    hwnd: *mut std::ffi::c_void,
-    screen_x: i32,
-    screen_y: i32,
-    flags: u32,
-) -> bool {
-    if device.is_null() {
-        return false;
-    }
-    let info = PointerTypeInfo {
-        pointer_type: PT_TOUCH,
-        touch_info: make_pointer_touch_info(hwnd, screen_x, screen_y, flags),
-    };
-    unsafe { InjectSyntheticPointerInput(device, &info, 1) != 0 }
-}
-
-#[cfg(windows)]
-fn touch_contact(
-    backend: TouchBackend,
-    syn_dev: *mut std::ffi::c_void,
-    hwnd: *mut std::ffi::c_void,
-    screen_x: i32,
-    screen_y: i32,
-    flags: u32,
-) -> bool {
-    match backend {
-        TouchBackend::Inject => inject_touch_contact(hwnd, screen_x, screen_y, flags),
-        TouchBackend::Synthetic => {
-            synthetic_touch_contact(syn_dev, hwnd, screen_x, screen_y, flags)
+    if want {
+        if hwnd.is_null() {
+            return;
         }
+        let mut rect = [0i32; 4];
+        if unsafe { GetClientRect(hwnd, rect.as_mut_ptr()) } == 0 {
+            return;
+        }
+        let mut tl = [rect[0], rect[1]];
+        let mut br = [rect[2], rect[3]];
+        if unsafe { ClientToScreen(hwnd, tl.as_mut_ptr()) } == 0
+            || unsafe { ClientToScreen(hwnd, br.as_mut_ptr()) } == 0
+        {
+            return;
+        }
+        let clip = [tl[0], tl[1], br[0], br[1]];
+        unsafe {
+            ClipCursor(clip.as_ptr());
+        }
+        *clipped = true;
+    } else {
+        unsafe {
+            ClipCursor(std::ptr::null());
+        }
+        *clipped = false;
+    }
+}
+
+/// Clip + hide curseur ; restore hors session / alt-tab (ShowCursor inclus).
+#[cfg(windows)]
+fn set_game_cursor_captured(
+    hwnd: *mut std::ffi::c_void,
+    want: bool,
+    captured: &mut bool,
+) {
+    if want == *captured {
+        return;
+    }
+    if want {
+        if hwnd.is_null() {
+            return;
+        }
+        let mut rect = [0i32; 4];
+        if unsafe { GetClientRect(hwnd, rect.as_mut_ptr()) } == 0 {
+            return;
+        }
+        let mut tl = [rect[0], rect[1]];
+        let mut br = [rect[2], rect[3]];
+        if unsafe { ClientToScreen(hwnd, tl.as_mut_ptr()) } == 0
+            || unsafe { ClientToScreen(hwnd, br.as_mut_ptr()) } == 0
+        {
+            return;
+        }
+        let clip = [tl[0], tl[1], br[0], br[1]];
+        unsafe {
+            ClipCursor(clip.as_ptr());
+            while ShowCursor(0) >= 0 {}
+        }
+        *captured = true;
+    } else {
+        unsafe {
+            ClipCursor(std::ptr::null());
+            while ShowCursor(1) < 0 {}
+        }
+        *captured = false;
     }
 }
 
@@ -5577,6 +6611,7 @@ extern "system" {
     fn SuspendThread(thread: *mut std::ffi::c_void) -> u32;
     fn ResumeThread(thread: *mut std::ffi::c_void) -> u32;
     fn GetCurrentThreadId() -> u32;
+    fn GetProcessId(process: *mut std::ffi::c_void) -> u32;
 }
 
 #[cfg(windows)]
@@ -5959,6 +6994,35 @@ fn start_party(
     ))
 }
 
+/// Flèches map/mode : maj live sans kill stub (gelé si join en cours).
+#[tauri::command]
+fn update_party_lobby(
+    app: AppHandle,
+    state: State<'_, StubState>,
+    port: Option<u16>,
+    lobby_name: String,
+    level_id: Option<u8>,
+    map_id: Option<u8>,
+    max_players: Option<u8>,
+    game_mode: Option<u8>,
+) -> Result<String, String> {
+    let map_id = map_id.unwrap_or(0);
+    let max_players = max_players.unwrap_or(8);
+    let game_mode = game_mode.unwrap_or(0);
+    let level_id = level_id.unwrap_or(game_mode.saturating_mul(6).saturating_add(map_id));
+    let port = port.unwrap_or(7891);
+    update_party_lobby_inner(
+        &app,
+        &state,
+        port,
+        &lobby_name,
+        level_id,
+        map_id,
+        max_players,
+        game_mode,
+    )
+}
+
 #[tauri::command]
 fn sync_lobby_inject(app: AppHandle, state: State<'_, StubState>) -> Result<String, String> {
     let lobby = state
@@ -6080,6 +7144,10 @@ fn spawn_phase_b_watcher(app: AppHandle) {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PhaseBState {
     Idle,
+    /// A1 drainé : forcer MapIdx puis injecter 0x10.
+    StartLoading,
+    /// Batch 0x10 en file.
+    StartLoadingQueued,
     Armed,
     ClockQueued,
     ClockDrained,
@@ -6094,6 +7162,9 @@ fn phase_b_watcher_loop(app: AppHandle) {
     let mut state = PhaseBState::Idle;
     let mut log_pos: u64 = 0;
     let mut saw_finished = false;
+    // 0x10 déjà poussé pour ce join — évite double StartLoading si cave blip → Idle.
+    let mut load_emitted = false;
+    let mut post_011_dumped = false;
     let mut armed_at: Option<Instant> = None;
     let mut send_clock_time: Option<u32> = None;
     let mut clock_drain_at: Option<Instant> = None;
@@ -6118,21 +7189,35 @@ fn phase_b_watcher_loop(app: AppHandle) {
         *dirty = false;
     };
 
+    let reset_join_flags = |saw_finished: &mut bool,
+                            load_emitted: &mut bool,
+                            post_011_dumped: &mut bool,
+                            armed_at: &mut Option<Instant>,
+                            send_clock_time: &mut Option<u32>,
+                            clock_drain_at: &mut Option<Instant>,
+                            need_sync_reply: &mut bool,
+                            sync_replied: &mut bool,
+                            class_select: &mut Option<(u8, u8, u8)>,
+                            class_replied: &mut bool,
+                            pending_packed: &mut u8| {
+        *saw_finished = false;
+        *load_emitted = false;
+        *post_011_dumped = false;
+        *armed_at = None;
+        *send_clock_time = None;
+        *clock_drain_at = None;
+        *need_sync_reply = false;
+        *sync_replied = false;
+        *class_select = None;
+        *class_replied = false;
+        *pending_packed = 0x01;
+    };
+
     loop {
         sleep(Duration::from_millis(120));
 
         let Some(inj) = resolve_inject_cave() else {
-            state = PhaseBState::Idle;
-            saw_finished = false;
-            armed_at = None;
-            send_clock_time = None;
-            clock_drain_at = None;
-            need_sync_reply = false;
-            sync_replied = false;
-            class_select = None;
-            class_replied = false;
-            pending_packed = 0x01;
-            reset_ack(&mut ack_seen, &mut ack_max, &mut ack_dirty);
+            // Ne pas repasser Idle mid-join (sinon double 0x10 au retour cave).
             continue;
         };
         let Some((mode, idx, _hits, join_ok)) = read_inject_meta(inj.process.0, inj.cave) else {
@@ -6148,25 +7233,61 @@ fn phase_b_watcher_loop(app: AppHandle) {
                     .ok()
                     .map(|g| g.clone());
                 if let Some(lobby) = lobby {
-                    let _ = write_inject_packet_blobs(inj.process.0, inj.cave, &lobby, false);
+                    let _ = write_inject_packet_blobs(
+                        inj.process.0,
+                        inj.cave,
+                        inj.image,
+                        &lobby,
+                        false,
+                    );
                 }
                 if last_log.elapsed() > Duration::from_secs(2) {
                     append_log(&app, "phase_b: reset (MODE=0)");
                     last_log = Instant::now();
                 }
             }
+            // Hors join : freelook autorisé (menus). Pendant join reste false.
+            FREELOOK_AFTER_LOAD.store(true, Ordering::Relaxed);
             state = PhaseBState::Idle;
-            saw_finished = false;
-            armed_at = None;
-            send_clock_time = None;
-            clock_drain_at = None;
-            need_sync_reply = false;
-            sync_replied = false;
-            class_select = None;
-            class_replied = false;
-            pending_packed = 0x01;
+            reset_join_flags(
+                &mut saw_finished,
+                &mut load_emitted,
+                &mut post_011_dumped,
+                &mut armed_at,
+                &mut send_clock_time,
+                &mut clock_drain_at,
+                &mut need_sync_reply,
+                &mut sync_replied,
+                &mut class_select,
+                &mut class_replied,
+                &mut pending_packed,
+            );
             reset_ack(&mut ack_seen, &mut ack_max, &mut ack_dirty);
             continue;
+        }
+
+        // Pendant A1 / load : freelook OFF. Réarmé après class confirm (voir Started).
+        if matches!(
+            state,
+            PhaseBState::Idle
+                | PhaseBState::StartLoading
+                | PhaseBState::StartLoadingQueued
+                | PhaseBState::Armed
+                | PhaseBState::ClockQueued
+                | PhaseBState::ClockDrained
+        ) {
+            FREELOOK_AFTER_LOAD.store(false, Ordering::Relaxed);
+        }
+
+        // Pendant A1 : pré-écrire MapIdx/GameMode (0x10 n'est pas encore dans la file).
+        if state == PhaseBState::Idle || state == PhaseBState::StartLoading {
+            if let Ok(guard) = app.state::<StubState>().lobby.lock() {
+                let msg = apply_mp_selection_to_game(inj.process.0, inj.image, &guard);
+                if last_log.elapsed() > Duration::from_secs(3) {
+                    append_log(&app, &format!("phase_b join MapIdx: {msg}"));
+                    last_log = Instant::now();
+                }
+            }
         }
 
         // Tail du log stub.
@@ -6177,7 +7298,14 @@ fn phase_b_watcher_loop(app: AppHandle) {
                 if f.read_to_string(&mut buf).is_ok() {
                     log_pos += buf.len() as u64;
                     for line in buf.lines() {
-                        if line.contains("type=0x11") || line.contains("FinishedLoading") {
+                        // Ignorer tout 0x11 reçu avant Armed (stale / pre-0x10).
+                        // Ne PAS activer freelook ici : mid-match trop tôt = crash client.
+                        if (line.contains("type=0x11") || line.contains("FinishedLoading"))
+                            && state == PhaseBState::Armed
+                        {
+                            if !saw_finished {
+                                append_log(&app, "phase_b: 0x11 FinishedLoading (freelook différé)");
+                            }
                             saw_finished = true;
                         }
                         if line.contains("SendClock") {
@@ -6228,7 +7356,90 @@ fn phase_b_watcher_loop(app: AppHandle) {
 
         match state {
             PhaseBState::Idle => {
-                if join_ok >= INJECT_JOIN_COUNT && idx >= INJECT_JOIN_COUNT {
+                // A1 (0x05+ACK×2) drainé → écrire MapIdx puis A2 (0x10).
+                // load_emitted : un seul 0x10 par join (MODE=1).
+                if !load_emitted && join_ok >= INJECT_JOIN_COUNT && idx >= INJECT_JOIN_COUNT {
+                    let msg = if let Ok(guard) = app.state::<StubState>().lobby.lock() {
+                        apply_mp_selection_to_game(inj.process.0, inj.image, &guard)
+                    } else {
+                        "lobby lock KO".into()
+                    };
+                    if last_log.elapsed() > Duration::from_secs(1) {
+                        append_log(&app, &format!("phase_b: A1 drained MapIdx: {msg}"));
+                        last_log = Instant::now();
+                    }
+                    if mp_selection_write_count(&msg) >= 1 {
+                        state = PhaseBState::StartLoading;
+                    }
+                }
+            }
+            PhaseBState::StartLoading => {
+                FREELOOK_AFTER_LOAD.store(false, Ordering::Relaxed);
+                let lobby = match app.state::<StubState>().lobby.lock() {
+                    Ok(g) => g.clone(),
+                    Err(_) => {
+                        if last_log.elapsed() > Duration::from_secs(2) {
+                            append_log(&app, "phase_b: await MapIdx before 0x10 (lobby lock KO)");
+                            last_log = Instant::now();
+                        }
+                        continue;
+                    }
+                };
+                let msg =
+                    apply_mp_level_load_target(inj.process.0, inj.image, inj.cave, &lobby);
+                if mp_selection_write_count(&msg) < 1 {
+                    if last_log.elapsed() > Duration::from_secs(2) {
+                        append_log(&app, &format!("phase_b: await MapIdx before 0x10 ({msg})"));
+                        last_log = Instant::now();
+                    }
+                    continue;
+                }
+                let dump = dump_mp_level_state(inj.process.0, inj.image, &lobby);
+                append_log(&app, &dump);
+                let level_idx = resolve_level_table_idx(
+                    inj.process.0,
+                    inj.image,
+                    lobby.game_mode,
+                    lobby.map_id,
+                )
+                .map(|(i, _)| i)
+                .unwrap_or_else(|| {
+                    resolve_level_table_idx_static(lobby.game_mode, lobby.map_id)
+                });
+                let _ = write_lobby_live_file_ex(&app, &lobby, Some(level_idx));
+                match inject_push_batch(
+                    inj.process.0,
+                    inj.cave,
+                    &build_phase_a_start_loading_batch(&lobby, level_idx),
+                ) {
+                    Ok(true) => {
+                        saw_finished = false;
+                        load_emitted = true;
+                        post_011_dumped = false;
+                        FREELOOK_AFTER_LOAD.store(false, Ordering::Relaxed);
+                        state = PhaseBState::StartLoadingQueued;
+                        append_log(
+                            &app,
+                            &format!(
+                                "phase_b: inject 0x10 StartLoading retail={} levelIdx={} mode={} after {msg}",
+                                lobby.map_id, level_idx, lobby.game_mode
+                            ),
+                        );
+                        last_log = Instant::now();
+                    }
+                    Ok(false) => {}
+                    Err(e) => append_log(&app, &format!("phase_b 0x10 err: {e}")),
+                }
+            }
+            PhaseBState::StartLoadingQueued => {
+                if idx >= INJECT_JOIN_COUNT {
+                    // Re-poke MapIdx après drain 0x10 : Select peut avoir
+                    // recopié name[3] wire → état interne.
+                    let repoke = if let Ok(guard) = app.state::<StubState>().lobby.lock() {
+                        apply_mp_selection_to_game(inj.process.0, inj.image, &guard)
+                    } else {
+                        "lobby lock KO".into()
+                    };
                     state = PhaseBState::Armed;
                     saw_finished = false;
                     armed_at = Some(Instant::now());
@@ -6245,19 +7456,38 @@ fn phase_b_watcher_loop(app: AppHandle) {
                             log_pos = meta.len();
                         }
                     }
-                    append_log(&app, "phase_b: armed (phase A drained)");
+                    append_log(
+                        &app,
+                        &format!("phase_b: armed (0x10 drained) repoke={repoke}"),
+                    );
                 }
             }
             PhaseBState::Armed => {
-                let timed_out = armed_at
-                    .map(|t| t.elapsed() >= Duration::from_secs(2))
-                    .unwrap_or(false);
-                if !saw_finished && !timed_out {
-                    continue;
+                // Ne JAMAIS forcer 0x06/0x12 pendant le load : Quais/Fort
+                // dépassent souvent 2s → StartGame mid-load = crash client.
+                FREELOOK_AFTER_LOAD.store(false, Ordering::Relaxed);
+                // Pas d'apply_mp en boucle ici : rewrite mid-stream → CTD / mauvais assets.
+                // MapIdx figé au drain 0x10 (repoke StartLoadingQueued).
+                if saw_finished && !post_011_dumped {
+                    post_011_dumped = true;
+                    // Pas de mode-restore ici : 3→2 juste avant ClassSelect = CTD.
+                    if let Ok(guard) = app.state::<StubState>().lobby.lock() {
+                        let dump = dump_mp_level_state(inj.process.0, inj.image, &guard);
+                        append_log(&app, &format!("phase_b: post-0x11 {dump}"));
+                    }
                 }
-                if !saw_finished && timed_out {
-                    append_log(&app, "phase_b: Armed timeout → force 0x06 (0x11 déjà passé?)");
-                    saw_finished = true;
+                if !saw_finished {
+                    if last_log.elapsed() > Duration::from_secs(5) {
+                        let waited = armed_at
+                            .map(|t| t.elapsed().as_secs())
+                            .unwrap_or(0);
+                        append_log(
+                            &app,
+                            &format!("phase_b: await 0x11 FinishedLoading ({waited}s)"),
+                        );
+                        last_log = Instant::now();
+                    }
+                    continue;
                 }
                 match inject_push_batch(inj.process.0, inj.cave, &build_phase_b_clock_batch()) {
                     Ok(true) => {
@@ -6349,6 +7579,10 @@ fn phase_b_watcher_loop(app: AppHandle) {
                                     class_replied = true;
                                     ack_dirty = false;
                                     last_ack = Instant::now();
+                                    // Match + classe OK : freelook safe (plus mid-load).
+                                    if !FREELOOK_AFTER_LOAD.swap(true, Ordering::Relaxed) {
+                                        append_log(&app, "phase_b: freelook armé (après class)");
+                                    }
                                     append_log(
                                         &app,
                                         &format!(
@@ -6362,6 +7596,13 @@ fn phase_b_watcher_loop(app: AppHandle) {
                             }
                             continue;
                         }
+                    }
+                    // Fallback : sync OK depuis ≥3s sans ClassSelect vu.
+                    if !FREELOOK_AFTER_LOAD.load(Ordering::Relaxed)
+                        && last_ack.elapsed() >= Duration::from_secs(3)
+                    {
+                        FREELOOK_AFTER_LOAD.store(true, Ordering::Relaxed);
+                        append_log(&app, "phase_b: freelook armé (fallback post-sync)");
                     }
                 }
 
@@ -6481,54 +7722,23 @@ fn launch_all(
     let max_players = max_players.unwrap_or(8);
     let game_mode = game_mode.unwrap_or(0);
     let level_id = level_id.unwrap_or(game_mode.saturating_mul(6).saturating_add(map_id));
-    let lobby = {
-        let mut guard = state.child.lock().map_err(|_| "lock stub".to_string())?;
-        if let Some(child) = guard.as_mut() {
-            if is_child_running(child) {
-                drop(guard);
-                state
-                    .lobby
-                    .lock()
-                    .map_err(|_| "lock lobby".to_string())?
-                    .clone()
-            } else {
-                *guard = None;
-                drop(guard);
-                spawn_stub(
-                    &app,
-                    &state,
-                    port,
-                    &lobby_name,
-                    level_id,
-                    map_id,
-                    max_players,
-                    game_mode,
-                )?;
-                state
-                    .lobby
-                    .lock()
-                    .map_err(|_| "lock lobby".to_string())?
-                    .clone()
-            }
-        } else {
-            drop(guard);
-            spawn_stub(
-                &app,
-                &state,
-                port,
-                &lobby_name,
-                level_id,
-                map_id,
-                max_players,
-                game_mode,
-            )?;
-            state
-                .lobby
-                .lock()
-                .map_err(|_| "lock lobby".to_string())?
-                .clone()
-        }
-    };
+    // Toujours (re)démarrer le stub avec la sélection courante — ne pas
+    // réutiliser un Node déjà lancé avec une ancienne carte/mode.
+    spawn_stub(
+        &app,
+        &state,
+        port,
+        &lobby_name,
+        level_id,
+        map_id,
+        max_players,
+        game_mode,
+    )?;
+    let lobby = state
+        .lobby
+        .lock()
+        .map_err(|_| "lock lobby".to_string())?
+        .clone();
 
     match launch_game_exe(&app, &game_path, &lobby) {
         Ok(()) => Ok(format!("En ligne — lobby {} :{port}", lobby.host_name)),
@@ -6554,6 +7764,7 @@ pub fn run() {
             get_status,
             stop_stub,
             start_party,
+            update_party_lobby,
             sync_lobby_inject,
             join_inject_debug,
             launch_game,
@@ -6561,7 +7772,8 @@ pub fn run() {
             find_game,
             reveal_game_path,
             open_game_store,
-            read_recent_logs
+            read_recent_logs,
+            set_look_settings
         ])
         .setup(|app| {
             append_log(app.handle(), "launcher démarré");

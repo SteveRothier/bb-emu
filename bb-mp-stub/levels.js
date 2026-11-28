@@ -1,40 +1,45 @@
 /**
- * Cartes / modes wire pour le 0x02 et le descripteur 0x05.
+ * Cartes / modes pour le 0x02 et le descripteur 0x05.
  *
  * 0x02 nameBytes (L=4), host stamp name[1]=playerCount ;
  * Joueurs UI = name[1]/name[2] (sinon mapId à [2] → « 1/0 ») :
- *   [0] gameMode | [1] playerCount | [2] maxPlayers | [3] mapId
+ *   [0] loadIdx | [1] playerCount | [2] maxPlayers | [3] loadIdx
+ * name[0]=name[3]=load (GetMPMapName = table 33). apply_mp / 0x10 = load.
+ * Mode stream = streamMode ?? modeId (TDM Store → FFA, sans restore mid-class).
  *
- * Preuves in-game :
- *   - ancien [1,1,8] (L=3) → préfixe « Capture du drapeau » ⇒ mode wire 1 = CTF
- *   - map wire 0 = Cathédrale ; map wire 5 = OVNI
- *     (ordre ci-dessous : Cat … Fort, UFO en dernier)
+ * Matrice maps↔modes : maps-modes.json (partagé avec le launcher).
  */
 
-const MAPS = [
-  { id: 0, label: "Cathédrale" },
-  { id: 1, label: "Madagascar" },
-  { id: 2, label: "Ruines de Madagascar" },
-  { id: 3, label: "Quais de Malte" },
-  { id: 4, label: "Fort de Malte" },
-  { id: 5, label: "Crash OVNI" },
-];
+const data = require("./maps-modes.json");
 
-/** Dom=0, CTF=1, DM=2, FFA=3 (CTF avant Deathmatch — calibrage wire). */
-const MODES = [
-  { id: 0, label: "Domination" },
-  { id: 1, label: "Capture de drapeau" },
-  { id: 2, label: "Match à mort" },
-  { id: 3, label: "Chacun pour soi" },
-];
-
-/** Cartes autorisées par mode (ids MAPS, ordre menu). */
-const MAPS_BY_MODE = {
-  0: [0, 1, 2, 4, 5], // Domination — pas Quais
-  1: [0, 1, 2, 3, 5], // CTF — pas Fort
-  2: [0, 2, 3, 4, 5], // Match à mort — pas Madagascar
-  3: [0, 2, 3, 5], // FFA
-};
+const MAPS = data.maps;
+const MODES = data.modes;
+const MAPS_BY_MODE = Object.fromEntries(
+  Object.entries(data.mapsByMode).map(([k, v]) => [Number(k), v]),
+);
+/** Plan table 33 par (mode, map) — source : maps-modes.json levelPlans. */
+const LEVEL_PLANS = Object.fromEntries(
+  Object.entries(data.levelPlans || {}).map(([mode, maps]) => [
+    Number(mode),
+    Object.fromEntries(
+      Object.entries(maps).map(([map, plan]) => [
+        Number(map),
+        {
+          titleIdx: plan.title,
+          loadIdx: plan.load,
+          aliasFrom:
+            plan.aliasFrom === undefined || plan.aliasFrom === null
+              ? null
+              : plan.aliasFrom,
+          streamMode:
+            plan.streamMode === undefined || plan.streamMode === null
+              ? null
+              : plan.streamMode,
+        },
+      ]),
+    ),
+  ]),
+);
 
 function clampU8(n, fallback) {
   const v = Number(n);
@@ -45,6 +50,65 @@ function clampU8(n, fallback) {
 function mapsForMode(modeId) {
   const ids = MAPS_BY_MODE[clampU8(modeId, 0)] || MAPS_BY_MODE[0];
   return ids.map((id) => MAPS.find((m) => m.id === id)).filter(Boolean);
+}
+
+/**
+ * Index carte dans mapsByMode[mode] pour le wire 0x02 name[3].
+ * Le client (liste serveurs) lit un **index de mode**, pas l'id absolu
+ * (sinon map=5 en Chacun pour soi → 5%4=1 → « Ruines »).
+ */
+function wireMapIndex(modeId, mapId) {
+  const allowed = MAPS_BY_MODE[clampU8(modeId, 0)] || MAPS_BY_MODE[0];
+  const abs = clampU8(mapId, allowed[0]);
+  const idx = allowed.indexOf(abs);
+  return idx >= 0 ? idx : 0;
+}
+
+function absoluteMapId(modeId, wireIndex) {
+  const allowed = MAPS_BY_MODE[clampU8(modeId, 0)] || MAPS_BY_MODE[0];
+  const i = clampU8(wireIndex, 0);
+  return allowed[Math.min(i, allowed.length - 1)] ?? allowed[0];
+}
+
+/**
+ * Plan niveau — cellule (mode, map) de maps-modes.json levelPlans.
+ * titleIdx = logs / lobby-live seulement (hors wire).
+ * loadIdx = name[0]=name[3] / menu+0x58 / MapIdx / 0x10 / sid.
+ * aliasFrom = donor table pour assets (launcher only) ; null = natif.
+ * streamMode = GameMode au load si ≠ modeId (ex. TDM→3).
+ */
+function levelPlan(modeId, mapId) {
+  const mode = clampU8(modeId, 0);
+  const map = clampU8(mapId, 0);
+  const cell = LEVEL_PLANS[mode] && LEVEL_PLANS[mode][map];
+  if (cell) {
+    return {
+      titleIdx: cell.titleIdx,
+      loadIdx: cell.loadIdx,
+      aliasFrom: cell.aliasFrom,
+      streamMode: cell.streamMode,
+    };
+  }
+  // Hors matrice (ex. Mad id 1) — ne pas inventer un load CTF.
+  return { titleIdx: map, loadIdx: map, aliasFrom: null, streamMode: null };
+}
+
+function levelStreamMode(modeId, mapId) {
+  const plan = levelPlan(modeId, mapId);
+  return plan.streamMode == null ? clampU8(modeId, 0) : plan.streamMode;
+}
+
+function levelTitleIdx(modeId, mapId) {
+  return levelPlan(modeId, mapId).titleIdx;
+}
+
+function levelLoadIdx(modeId, mapId) {
+  return levelPlan(modeId, mapId).loadIdx;
+}
+
+/** Index table load (MapIdx / 0x10) — pas le titre liste. */
+function retailToLevelIdx(modeId, mapId) {
+  return levelLoadIdx(modeId, mapId);
 }
 
 function resolveModeMap({ mode, map } = {}) {
@@ -58,6 +122,7 @@ function resolveModeMap({ mode, map } = {}) {
   return {
     modeId,
     mapId,
+    wireMapIndex: wireMapIndex(modeId, mapId),
     modeLabel: modeMeta?.label ?? String(modeId),
     mapLabel: mapMeta?.label ?? String(mapId),
     label: `${modeMeta?.label ?? modeId} · ${mapMeta?.label ?? mapId}`,
@@ -67,7 +132,6 @@ function resolveModeMap({ mode, map } = {}) {
 /** @deprecated alias — plus d’index de niveau dense pour le 0x02 */
 function resolveLevelIndex(opts = {}) {
   const r = resolveModeMap(opts);
-  // conserve un « level » stable pour logs / UI : mode*6 + map
   return r.modeId * 6 + r.mapId;
 }
 
@@ -107,4 +171,11 @@ module.exports = {
   resolveLevelIndex,
   resolveModeMap,
   mapsForMode,
+  wireMapIndex,
+  absoluteMapId,
+  levelPlan,
+  levelTitleIdx,
+  levelLoadIdx,
+  levelStreamMode,
+  retailToLevelIdx,
 };

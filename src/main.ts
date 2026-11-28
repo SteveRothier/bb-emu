@@ -14,6 +14,7 @@ import {
   CircleAlert,
 } from "lucide";
 import type { IconNode } from "lucide";
+import mapsModes from "../bb-mp-stub/maps-modes.json";
 import "./styles.css";
 
 type Config = {
@@ -21,6 +22,8 @@ type Config = {
   lastLobbyName: string;
   lastMapId: number;
   lastGameMode: number;
+  /** Multiplicateur sensibilité souris (1 = défaut packer 0.06). */
+  lookSensitivity: number;
 };
 
 const DEFAULT_CONFIG: Config = {
@@ -28,35 +31,29 @@ const DEFAULT_CONFIG: Config = {
   lastLobbyName: "MaPartie",
   lastMapId: 0, // Cathédrale (wire)
   lastGameMode: 0, // Domination
+  lookSensitivity: 1,
 };
 
-/**
- * Wire 0x02 name = [gameMode, playerCount, maxPlayers, mapId] (voir levels.js).
- * Modes : Dom=0, CTF=1, DM=2, FFA=3. Cartes : Cat=0 … OVNI=5.
- */
-const MAP_OPTIONS = [
-  { id: 0, label: "Cathédrale" },
-  { id: 1, label: "Madagascar" },
-  { id: 2, label: "Ruines de Madagascar" },
-  { id: 3, label: "Quais de Malte" },
-  { id: 4, label: "Fort de Malte" },
-  { id: 5, label: "Crash OVNI" },
-];
+/** Source unique : bb-mp-stub/maps-modes.json (aussi lu par levels.js). */
+const MAP_OPTIONS = mapsModes.maps;
+const MODE_OPTIONS = mapsModes.modes;
+const MAPS_BY_MODE: Record<number, number[]> = Object.fromEntries(
+  Object.entries(mapsModes.mapsByMode).map(([k, v]) => [Number(k), v as number[]]),
+);
 
-const MODE_OPTIONS = [
-  { id: 0, label: "Domination" },
-  { id: 1, label: "Capture de drapeau" },
-  { id: 2, label: "Match à mort" },
-  { id: 3, label: "Chacun pour soi" },
-];
-
-/** Cartes autorisées par mode (ids wire). */
-const MAPS_BY_MODE: Record<number, number[]> = {
-  0: [0, 1, 2, 4, 5],
-  1: [0, 1, 2, 3, 5],
-  2: [0, 2, 3, 4, 5],
-  3: [0, 2, 3, 5],
-};
+/** Modes autorisés pour une carte (dérivé de mapsByMode). */
+const MODES_BY_MAP: Record<number, number[]> = (() => {
+  const out: Record<number, number[]> = {};
+  for (const m of MAP_OPTIONS) out[m.id] = [];
+  for (const [modeStr, maps] of Object.entries(MAPS_BY_MODE)) {
+    const modeId = Number(modeStr);
+    for (const mapId of maps) {
+      if (!out[mapId].includes(modeId)) out[mapId].push(modeId);
+    }
+  }
+  for (const id of Object.keys(out)) out[Number(id)].sort((a, b) => a - b);
+  return out;
+})();
 
 function resolveLevelIndex(modeId: number, mapId: number): number {
   return modeId * 6 + mapId;
@@ -87,6 +84,7 @@ function loadConfig(): Config {
     const raw = localStorage.getItem("bb-emu-config");
     if (!raw) return { ...DEFAULT_CONFIG };
     const parsed = JSON.parse(raw) as Partial<Config>;
+    const sens = Number(parsed.lookSensitivity);
     return {
       gamePath: String(parsed.gamePath || ""),
       lastLobbyName: String(parsed.lastLobbyName || DEFAULT_CONFIG.lastLobbyName).slice(
@@ -95,6 +93,9 @@ function loadConfig(): Config {
       ),
       lastMapId: Math.max(0, Math.min(255, Number(parsed.lastMapId) || 0)),
       lastGameMode: Math.max(0, Math.min(255, Number(parsed.lastGameMode) || 0)),
+      lookSensitivity: Number.isFinite(sens)
+        ? Math.max(0.25, Math.min(3, sens))
+        : DEFAULT_CONFIG.lookSensitivity,
     };
   } catch {
     return { ...DEFAULT_CONFIG };
@@ -190,13 +191,51 @@ app.innerHTML = `
           </span>
           <input id="cfg-name" type="text" maxlength="${LOBBY_MAX_LEN}" autocomplete="off" spellcheck="false" />
         </label>
-        <label class="cfg-band cfg-band-select">
-          <span class="cfg-band-label">Carte</span>
-          <select id="cfg-map" aria-label="Carte"></select>
-        </label>
-        <label class="cfg-band cfg-band-select">
-          <span class="cfg-band-label">Mode</span>
-          <select id="cfg-mode" aria-label="Mode"></select>
+
+        <div class="bb-lobby-select">
+          <div class="bb-cycle" data-cycle="mode">
+            <p class="bb-cycle-label">Mode de jeu</p>
+            <div class="bb-cycle-row">
+              <button type="button" class="bb-cycle-arrow" id="cfg-mode-prev" aria-label="Mode précédent">
+                <span class="bb-cycle-chevron bb-cycle-chevron-l" aria-hidden="true"></span>
+              </button>
+              <div class="bb-cycle-panel" id="cfg-mode-panel" role="status" aria-live="polite">
+                <span id="cfg-mode-text">Domination</span>
+              </div>
+              <button type="button" class="bb-cycle-arrow" id="cfg-mode-next" aria-label="Mode suivant">
+                <span class="bb-cycle-chevron bb-cycle-chevron-r" aria-hidden="true"></span>
+              </button>
+            </div>
+          </div>
+
+          <div class="bb-cycle" data-cycle="map">
+            <p class="bb-cycle-label">Carte</p>
+            <div class="bb-cycle-row">
+              <button type="button" class="bb-cycle-arrow" id="cfg-map-prev" aria-label="Carte précédente">
+                <span class="bb-cycle-chevron bb-cycle-chevron-l" aria-hidden="true"></span>
+              </button>
+              <div class="bb-cycle-panel" id="cfg-map-panel" role="status" aria-live="polite">
+                <span id="cfg-map-text">Cathédrale</span>
+              </div>
+              <button type="button" class="bb-cycle-arrow" id="cfg-map-next" aria-label="Carte suivante">
+                <span class="bb-cycle-chevron bb-cycle-chevron-r" aria-hidden="true"></span>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <p class="cfg-kicker">Souris FPS</p>
+        <label class="cfg-band cfg-band-sens">
+          <span class="cfg-band-label">Sens.</span>
+          <input
+            id="cfg-look-sens"
+            type="range"
+            min="25"
+            max="300"
+            step="5"
+            aria-label="Sensibilité souris"
+          />
+          <span class="cfg-sens-val" id="cfg-look-sens-val">100%</span>
         </label>
 
         <div class="config-actions">
@@ -235,9 +274,19 @@ const btnPartyToggleLabel = document.querySelector<HTMLElement>("#btn-party-togg
 const configEl = document.querySelector<HTMLElement>("#config")!;
 const cfgName = document.querySelector<HTMLInputElement>("#cfg-name")!;
 const cfgNameCount = document.querySelector<HTMLElement>("#cfg-name-count")!;
-const cfgMap = document.querySelector<HTMLSelectElement>("#cfg-map")!;
-const cfgMode = document.querySelector<HTMLSelectElement>("#cfg-mode")!;
+const cfgModeText = document.querySelector<HTMLElement>("#cfg-mode-text")!;
+const cfgMapText = document.querySelector<HTMLElement>("#cfg-map-text")!;
+const cfgModePrev = document.querySelector<HTMLButtonElement>("#cfg-mode-prev")!;
+const cfgModeNext = document.querySelector<HTMLButtonElement>("#cfg-mode-next")!;
+const cfgMapPrev = document.querySelector<HTMLButtonElement>("#cfg-map-prev")!;
+const cfgMapNext = document.querySelector<HTMLButtonElement>("#cfg-map-next")!;
+const cfgLookSens = document.querySelector<HTMLInputElement>("#cfg-look-sens")!;
+const cfgLookSensVal = document.querySelector<HTMLElement>("#cfg-look-sens-val")!;
 const cfgGameBtn = document.querySelector<HTMLButtonElement>("#cfg-game-btn")!;
+
+/** Sélection courante mode/carte (wire ids). */
+let draftModeId = 0;
+let draftMapId = 0;
 const cfgGameText = document.querySelector<HTMLElement>("#cfg-game-text")!;
 const btnStore = document.querySelector<HTMLButtonElement>("#btn-store")!;
 const statusRow = document.querySelector<HTMLElement>("#status-row")!;
@@ -273,13 +322,27 @@ async function ensurePartyWithDraft(lobby: {
 }) {
   const same =
     partyLive && activeParty != null && lobbyKey(activeParty) === lobbyKey(lobby);
-  if (same) return;
+  if (same) {
+    await syncLobbyInjectQuiet();
+    return;
+  }
 
   if (partyLive) {
-    await invoke("stop_stub");
-    partyLive = false;
-    activeParty = null;
-    syncPartyToggle();
+    // Hot-update sans kill Node (évite course Quais→Fort pendant Rejoindre).
+    const msg = await invoke<string>("update_party_lobby", {
+      port: 7891,
+      lobbyName: lobby.name,
+      levelId: lobby.levelId,
+      mapId: lobby.mapId,
+      maxPlayers: 8,
+      gameMode: lobby.gameMode,
+    });
+    if (typeof msg === "string" && msg.includes("frozen")) {
+      // Join en cours : brouillon UI ok, carte wire figée.
+      return;
+    }
+    activeParty = { ...lobby };
+    return;
   }
 
   await invoke("start_party", {
@@ -296,6 +359,19 @@ async function ensurePartyWithDraft(lobby: {
   await syncLobbyInjectQuiet();
 }
 
+/** Applique le brouillon au stub si une partie tourne déjà (changement flèche). */
+async function pushDraftIfPartyLive() {
+  if (!partyLive || busy || booting) return;
+  const lobby = readLobbyDraft();
+  persistDraft(lobby);
+  try {
+    await ensurePartyWithDraft(lobby);
+  } catch (err) {
+    flashStatus("err", shortErr(err instanceof Error ? err.message : String(err)));
+    await refreshPartyStatus();
+  }
+}
+
 async function syncLobbyInjectQuiet() {
   try {
     await invoke("sync_lobby_inject");
@@ -304,52 +380,95 @@ async function syncLobbyInjectQuiet() {
   }
 }
 
-for (const m of MODE_OPTIONS) {
-  const opt = document.createElement("option");
-  opt.value = String(m.id);
-  opt.textContent = m.label;
-  cfgMode.append(opt);
-}
-refillMapOptions(0, 0);
-
-cfgMode.addEventListener("change", () => {
-  refillMapOptions(Number(cfgMode.value) || 0);
-});
-
 function syncNameCount() {
   cfgNameCount.textContent = `${cfgName.value.length}/${LOBBY_MAX_LEN}`;
 }
 
-function refillMapOptions(modeId: number, preferredMapId?: number) {
-  const allowed = MAPS_BY_MODE[modeId] || MAPS_BY_MODE[0];
-  const prev = preferredMapId ?? Number(cfgMap.value);
-  cfgMap.replaceChildren();
-  for (const id of allowed) {
-    const m = MAP_OPTIONS.find((x) => x.id === id);
-    if (!m) continue;
-    const opt = document.createElement("option");
-    opt.value = String(m.id);
-    opt.textContent = m.label;
-    cfgMap.append(opt);
-  }
-  cfgMap.value = allowed.includes(prev) ? String(prev) : String(allowed[0]);
+function mapsAllowedForMode(modeId: number): number[] {
+  return MAPS_BY_MODE[modeId] || MAPS_BY_MODE[0];
 }
+
+function modesAllowedForMap(mapId: number): number[] {
+  return MODES_BY_MAP[mapId] || MODE_OPTIONS.map((m) => m.id);
+}
+
+function clampMapForMode(modeId: number, mapId: number): number {
+  const allowed = mapsAllowedForMode(modeId);
+  return allowed.includes(mapId) ? mapId : allowed[0];
+}
+
+function clampModeForMap(mapId: number, modeId: number): number {
+  const allowed = modesAllowedForMap(mapId);
+  return allowed.includes(modeId) ? modeId : allowed[0];
+}
+
+function renderModeCycle() {
+  const mode = MODE_OPTIONS.find((m) => m.id === draftModeId) ?? MODE_OPTIONS[0];
+  cfgModeText.textContent = mode.label.toUpperCase();
+}
+
+function renderMapCycle() {
+  draftMapId = clampMapForMode(draftModeId, draftMapId);
+  const map = MAP_OPTIONS.find((m) => m.id === draftMapId) ?? MAP_OPTIONS[0];
+  cfgMapText.textContent = map.label.toUpperCase();
+}
+
+function cycleMode(delta: number) {
+  const ids = MODE_OPTIONS.map((m) => m.id);
+  const i = Math.max(0, ids.indexOf(draftModeId));
+  draftModeId = ids[(i + delta + ids.length) % ids.length];
+  draftMapId = clampMapForMode(draftModeId, draftMapId);
+  renderModeCycle();
+  renderMapCycle();
+  void pushDraftIfPartyLive();
+}
+
+function cycleMap(delta: number) {
+  const allowed = mapsAllowedForMode(draftModeId);
+  const i = Math.max(0, allowed.indexOf(draftMapId));
+  draftMapId = allowed[(i + delta + allowed.length) % allowed.length];
+  // Sécurité : mode toujours valide pour la carte affichée.
+  draftModeId = clampModeForMap(draftMapId, draftModeId);
+  renderModeCycle();
+  renderMapCycle();
+  void pushDraftIfPartyLive();
+}
+
+cfgModePrev.addEventListener("click", () => cycleMode(-1));
+cfgModeNext.addEventListener("click", () => cycleMode(1));
+cfgMapPrev.addEventListener("click", () => cycleMap(-1));
+cfgMapNext.addEventListener("click", () => cycleMap(1));
 
 function fillDraftFromConfig() {
   cfgName.value = (config.lastLobbyName || DEFAULT_CONFIG.lastLobbyName).slice(0, LOBBY_MAX_LEN);
-  const modeId = MODE_OPTIONS.some((m) => m.id === config.lastGameMode)
+  draftModeId = MODE_OPTIONS.some((m) => m.id === config.lastGameMode)
     ? config.lastGameMode
     : 0;
-  cfgMode.value = String(modeId);
-  refillMapOptions(modeId, config.lastMapId ?? 0);
+  draftMapId = clampMapForMode(draftModeId, config.lastMapId ?? 0);
+  renderModeCycle();
+  renderMapCycle();
+  const pct = Math.round((config.lookSensitivity || 1) * 100);
+  cfgLookSens.value = String(Math.max(25, Math.min(300, pct)));
+  cfgLookSensVal.textContent = `${cfgLookSens.value}%`;
   syncNameCount();
+}
+
+async function pushLookSettings() {
+  const sensitivity = Math.max(0.25, Math.min(3, Number(cfgLookSens.value) / 100 || 1));
+  config = { ...config, lookSensitivity: sensitivity };
+  saveConfig(config);
+  try {
+    await invoke("set_look_settings", { sensitivity });
+  } catch {
+    /* ignore — watcher peut être hors Windows */
+  }
 }
 
 function readLobbyDraft() {
   let name = cfgName.value.trim() || "MaPartie";
   name = [...name].slice(0, LOBBY_MAX_LEN).join("");
-  const mapId = Math.max(0, Math.min(255, Number(cfgMap.value) || 0));
-  const gameMode = Math.max(0, Math.min(255, Number(cfgMode.value) || 0));
+  const gameMode = draftModeId;
+  const mapId = clampMapForMode(gameMode, draftMapId);
   const levelId = resolveLevelIndex(gameMode, mapId);
   return { name, mapId, gameMode, levelId };
 }
@@ -383,6 +502,15 @@ let draftPath = config.gamePath;
 let busy = false;
 
 cfgGameText.textContent = shortPath(draftPath);
+fillDraftFromConfig();
+void pushLookSettings();
+
+cfgLookSens.addEventListener("input", () => {
+  cfgLookSensVal.textContent = `${cfgLookSens.value}%`;
+});
+cfgLookSens.addEventListener("change", () => {
+  void pushLookSettings();
+});
 
 void getVersion()
   .then((v) => {
@@ -541,9 +669,11 @@ function persistDraft(lobby?: {
     lastLobbyName: L.name,
     lastMapId: L.mapId,
     lastGameMode: L.gameMode,
+    lookSensitivity: Math.max(0.25, Math.min(3, Number(cfgLookSens.value) / 100 || 1)),
   };
   saveConfig(config);
   cfgGameText.textContent = shortPath(config.gamePath);
+  void pushLookSettings();
 }
 
 btnPartyToggle.addEventListener("click", async () => {

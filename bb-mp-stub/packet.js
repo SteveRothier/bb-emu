@@ -97,7 +97,8 @@ function buildDiscover({ magic = GAME_ID } = {}) {
  *   body: u32be gameId | u8 L + nameBytes | deviceName[0x14]
  * nameBytes (L=4) — host stamp name[1]=playerCount ;
  * Joueurs UI = name[1]/name[2] :
- *   [0] gameMode | [1] playerCount | [2] maxPlayers | [3] mapId
+ *   [0] loadIdx | [1] playerCount | [2] maxPlayers | [3] loadIdx
+ * name[0]=name[3]=load (GetMPMapName = table 33). apply_mp / 0x10 = load.
  * deviceName[0x14] = nom d'hôte (« Comms: Discovered Server name %s »).
  */
 function buildServerGameDetails({
@@ -116,6 +117,7 @@ function buildServerGameDetails({
   const host = hostName || deviceName || serverName || "MaPartie";
   void levelIndex;
   const slots = maxPlayers < 2 ? 8 : maxPlayers & 0xff;
+  // Params historiques gameMode/mapId = octets name[0]/name[3] (souvent levelIdx).
   const nameBytes = Buffer.from([
     gameMode & 0xff,
     playerCount & 0xff,

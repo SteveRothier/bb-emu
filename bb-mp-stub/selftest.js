@@ -60,15 +60,84 @@ function assert(cond, msg) {
 }
 
 {
-  const { resolveModeMap, MODES } = require("./levels");
+  const { resolveModeMap, MODES, wireMapIndex, retailToLevelIdx } = require("./levels");
   assert(MODES[1].label.includes("drapeau"), "mode 1 = CTF");
-  const domMad = resolveModeMap({ mode: 0, map: 1 });
-  assert(domMad.mapId === 1 && domMad.modeId === 0, "Dom/Madagascar");
+  const domRuines = resolveModeMap({ mode: 0, map: 2 });
+  assert(domRuines.mapId === 2 && domRuines.modeId === 0, "Dom/Ruines");
+  assert(wireMapIndex(3, 3) === 0, "wire Quais@FFA helper");
+  assert(wireMapIndex(3, 5) === 1, "wire Crash@FFA helper");
+  const { levelTitleIdx, levelLoadIdx, levelPlan } = require("./levels");
+  assert(resolveModeMap({ mode: 0, map: 1 }).mapId !== 1, "Madagascar hors Dom");
+  assert(resolveModeMap({ mode: 1, map: 1 }).mapId !== 1, "Madagascar hors CTF");
+  assert(levelPlan(0, 1).loadIdx === 1 && levelPlan(0, 1).aliasFrom == null, "Mad hors matrice");
+  assert(levelTitleIdx(1, 2) === 13 && levelLoadIdx(1, 2) === 12, "Ruines@CTF load 12");
+  assert(levelTitleIdx(0, 2) === 3 && levelLoadIdx(0, 2) === 12, "Ruines@Dom load 12");
+  assert(resolveModeMap({ mode: 2, map: 2 }).mapId !== 2, "Ruines hors TDM");
+  assert(resolveModeMap({ mode: 2, map: 0 }).mapId !== 0, "Cathédrale hors TDM");
+  assert(levelTitleIdx(1, 3) === 11 && levelLoadIdx(1, 3) === 11, "Quais@CTF load 11");
+  assert(levelTitleIdx(2, 3) === 10 && levelLoadIdx(2, 3) === 10, "Quais@TDM load 10");
+  assert(levelPlan(2, 3).streamMode === 3, "Quais@TDM stream FFA");
+  assert(levelPlan(2, 4).streamMode === 0, "Fort@TDM stream Dom");
+  assert(levelTitleIdx(3, 3) === 10 && levelLoadIdx(3, 3) === 10, "Quais@FFA load 10");
+  assert(levelTitleIdx(1, 0) === 1 && levelLoadIdx(1, 0) === 0, "Cathédrale@CTF load 0");
+  assert(levelTitleIdx(0, 0) === 0 && levelLoadIdx(0, 0) === 0, "Cathédrale@Dom load 0");
+  assert(levelTitleIdx(0, 4) === 5 && levelLoadIdx(0, 4) === 5, "Fort@Dom load 5");
+  assert(levelPlan(1, 2).aliasFrom == null, "Ruines@CTF pas d'alias");
+  assert(levelPlan(0, 2).aliasFrom == null, "Ruines@Dom pas d'alias");
+  assert(wireMapIndex(1, 2) === 1, "wire Ruines@CTF = 1");
+  const ruinesLoad = levelLoadIdx(1, 2);
+  const sgRuines = buildServerGameDetails({
+    gameMode: ruinesLoad,
+    mapId: ruinesLoad,
+    playerCount: 1,
+    maxPlayers: 8,
+  });
+  const pr = parsePacket(sgRuines);
+  assert(
+    pr.body[5] === 12 && pr.body[8] === 12,
+    "0x02 Ruines@CTF name=[12,1,8,12] load"
+  );
+  const cathLoad = levelLoadIdx(1, 0);
+  const sgCath = buildServerGameDetails({
+    gameMode: cathLoad,
+    mapId: cathLoad,
+    playerCount: 1,
+    maxPlayers: 8,
+  });
+  const pc = parsePacket(sgCath);
+  assert(
+    pc.body[5] === 0 && pc.body[8] === 0,
+    "0x02 Cathédrale@CTF name=[0,1,8,0] load"
+  );
+  const quaisLoad = levelLoadIdx(2, 3);
+  const sgQuais = buildServerGameDetails({
+    gameMode: quaisLoad,
+    mapId: quaisLoad,
+    playerCount: 1,
+    maxPlayers: 8,
+  });
+  const pq = parsePacket(sgQuais);
+  assert(pq.body[5] === 10 && pq.body[8] === 10, "0x02 Quais@TDM name=[10,*,*,10] load");
 }
 
 {
-  const d = buildLobbyDescriptor({ gameMode: 1, mapId: 4, maxPlayers: 8, flags: 0 });
-  assert(d.equals(Buffer.from([1, 4, 8, 0])), "descriptor");
+  const { levelLoadIdx: loadIdx05 } = require("./levels");
+  const fortLoad = loadIdx05(0, 4);
+  const d = buildLobbyDescriptor({
+    gameMode: 0,
+    mapId: fortLoad,
+    maxPlayers: 8,
+    flags: 0,
+  });
+  assert(d.equals(Buffer.from([0, 5, 8, 0])), "descriptor Fort@Dom load=5");
+  const ruinesLoad05 = loadIdx05(1, 2);
+  const d2 = buildLobbyDescriptor({
+    gameMode: 1,
+    mapId: ruinesLoad05,
+    maxPlayers: 8,
+    flags: 0,
+  });
+  assert(d2.equals(Buffer.from([1, 12, 8, 0])), "descriptor Ruines load=12");
 }
 
 {
@@ -166,7 +235,6 @@ function waitForListen() {
     let clockReplied = false;
     let gotAckBeforeStart = false;
     let positionsSent = false;
-    let gotPosEcho = false;
     let idxOf12 = -1;
 
     await new Promise((resolve, reject) => {
@@ -185,7 +253,8 @@ function waitForListen() {
           if (idxOf12 < 0) gotAckBeforeStart = true;
         }
 
-        if (p.type === 0x10 && !finishedSent) {
+        // Stub n'envoie plus 0x10 (launcher) — 0x11 après 0x05/0x16.
+        if (p.type === 0x16 && !finishedSent) {
           finishedSent = true;
           client.send(
             buildFinishedLoading({ flag: 1, peerA: 1, peerB: 0, seqMask: 0 }),
@@ -224,13 +293,14 @@ function waitForListen() {
           }
         }
 
-        if (p.messages && p.messages.some((m) => m.type === 0x4d) && p.messages.some((m) => m.type === 0x17)) {
-          // Echo from stub (not our own send — stub replies after our bundle)
-          if (positionsSent) gotPosEcho = true;
-        }
-
-        const need = [0x02, 0x05, 0x16, 0x10, 0x06, 0x08, 0x12, 0x0d, 0x0e];
-        if (need.every((t) => seen.includes(t)) && gotAckBeforeStart && gotPosEcho) {
+        // Pas d'echo 0x4D : solo = client autoritatif.
+        const need = [0x02, 0x05, 0x16, 0x06, 0x08, 0x12, 0x0d, 0x0e];
+        if (
+          need.every((t) => seen.includes(t)) &&
+          gotAckBeforeStart &&
+          positionsSent &&
+          stdout.includes("PlayerTransform")
+        ) {
           clearTimeout(timer);
           resolve();
         }
@@ -255,13 +325,13 @@ function waitForListen() {
     const i12 = seen.indexOf(0x12);
     assert(i06 >= 0 && i08 > i06 && i12 > i08, "clock order 0x06→0x08→0x12");
     assert(gotAckBeforeStart, "got 0x0F ACK before StartGame");
-    assert(gotPosEcho, "got positions echo 0x4D+0x17");
+    assert(!stdout.includes("PositionsEcho"), "pas d'echo 0x4D PositionsEcho");
     assert(stdout.includes("FinishedLoading"), "log 0x11");
     assert(stdout.includes("SendClock") || stdout.includes("0x07"), "log clock reply");
     assert(stdout.includes("PlayerTransform") || stdout.includes("PositionsEnvelope"), "log positions");
 
     console.log(
-      "UDP keepalive+positions OK:",
+      "UDP keepalive+positions OK (no 0x4D echo):",
       seen.map((t) => "0x" + t.toString(16)).join(", ")
     );
     client.close();

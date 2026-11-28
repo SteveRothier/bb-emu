@@ -1,16 +1,16 @@
 /**
  * UDP stub for Blitz Brigade local MP (port 7891 by default).
  *
- * Join:  0x01→0x02 ; 0x03→0x05+0x16+0x10
+ * Join UDP: 0x01→0x02 ; 0x03→0x05+0x16 (pas de 0x10 — inject launcher seul)
  * Keepalive after 0x11: 0x06 ReqClock → (0x07) → 0x08 TimeSync → 0x12 StartGame
- * ACK: on flag≠0 inbound, emit 0x0F with peerB/seqMask (piggybacked on all replies too)
- * Ping: every 3s after join, 0x0D + 0x0E
+ * Lobby live: lobby-live.json relu à chaque Discover/Join (flèches sans kill Node)
  *
- * CLI (prioritaire sur env):
+ * CLI:
  *   --port N --lobby NAME --map ID --max-players N --mode N --level N --log PATH
  */
 
 const fs = require("fs");
+const path = require("path");
 const dgram = require("dgram");
 const {
   parsePacket,
@@ -21,21 +21,19 @@ const {
   buildLobbyDetails,
   buildLobbyDescriptor,
   buildNewPlayer,
-  buildStartLoading,
   buildStartGame,
   buildReqClock,
   buildTimeSync,
   buildCommsPing,
   buildPlayerPings,
   buildAckOnly,
-  buildPositionsEnvelope,
   parsePlayerTransform,
   createAckState,
   noteReliableSeq,
   ackHeaderFields,
   GAME_ID,
 } = require("./packet");
-const { resolveModeMap } = require("./levels");
+const { resolveModeMap, wireMapIndex } = require("./levels");
 
 function parseArgs(argv) {
   const out = {};
@@ -68,14 +66,77 @@ const LOBBY_NAME = String(args.lobby || process.env.BB_LOBBY_NAME || "MaPartie")
   .trim()
   .slice(0, 16) || "MaPartie";
 const MAX_PLAYERS = clampU8(args["max-players"] ?? process.env.BB_MAX_PLAYERS, 8) || 8;
-const LOBBY = resolveModeMap({
+const BOOT_LOBBY = resolveModeMap({
   mode: args.mode ?? process.env.BB_GAME_MODE,
   map: args.map ?? process.env.BB_MAP_ID,
 });
-const MAP_ID = LOBBY.mapId;
-const GAME_MODE = LOBBY.modeId;
+const LIVE_PATH = path.join(__dirname, "lobby-live.json");
 const PING_MS = Number(process.env.BB_MP_PING_MS || 3000);
 const CLOCK_FALLBACK_MS = Number(process.env.BB_MP_CLOCK_FALLBACK_MS || 500);
+
+function writeBootLiveFile() {
+  try {
+    fs.writeFileSync(
+      LIVE_PATH,
+      JSON.stringify({
+        hostName: LOBBY_NAME,
+        mapId: BOOT_LOBBY.mapId,
+        modeId: BOOT_LOBBY.modeId,
+        maxPlayers: MAX_PLAYERS,
+      }),
+      "utf8"
+    );
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+/** Relecture hot-update (launcher flèches sans restart Node). */
+function readLiveLobby() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(LIVE_PATH, "utf8"));
+    const resolved = resolveModeMap({
+      mode: raw.modeId ?? raw.mode ?? BOOT_LOBBY.modeId,
+      map: raw.mapId ?? raw.map ?? BOOT_LOBBY.mapId,
+    });
+    const host =
+      String(raw.hostName || LOBBY_NAME)
+        .trim()
+        .slice(0, 16) || LOBBY_NAME;
+    const maxPlayers = clampU8(raw.maxPlayers ?? MAX_PLAYERS, MAX_PLAYERS) || MAX_PLAYERS;
+    const parseIdx = (v) =>
+      v !== undefined && v !== null && Number.isFinite(Number(v))
+        ? Math.max(0, Math.min(255, Number(v) | 0))
+        : null;
+    const levelIdx = parseIdx(raw.levelIdx ?? raw.level_idx);
+    const titleIdx = parseIdx(raw.titleIdx ?? raw.title_idx);
+    const loadIdx = parseIdx(raw.loadIdx ?? raw.load_idx) ?? levelIdx;
+    return {
+      hostName: host,
+      maxPlayers,
+      mapId: resolved.mapId,
+      modeId: resolved.modeId,
+      /** loadIdx (MapIdx) — compat levelIdx. */
+      levelIdx: loadIdx,
+      titleIdx,
+      loadIdx,
+      label: resolved.label,
+    };
+  } catch (_) {
+    return {
+      hostName: LOBBY_NAME,
+      maxPlayers: MAX_PLAYERS,
+      mapId: BOOT_LOBBY.mapId,
+      modeId: BOOT_LOBBY.modeId,
+      levelIdx: null,
+      titleIdx: null,
+      loadIdx: null,
+      label: BOOT_LOBBY.label,
+    };
+  }
+}
+
+writeBootLiveFile();
 
 if (args.log) {
   try {
@@ -115,6 +176,7 @@ function getPeer(rinfo) {
       clockDone: false,
       started: false,
       clockTimer: null,
+      loadingTimer: null,
       pingSeq: 0,
     });
   }
@@ -151,52 +213,78 @@ function playerFromDetails(details, deviceId = 0) {
   };
 }
 
-function connectedCount() {
+function connectedCount(maxPlayers) {
   let n = 1; // host slot
   for (const p of peers.values()) {
     if (p.joined) n++;
   }
-  return Math.min(n, MAX_PLAYERS);
+  return Math.min(n, maxPlayers);
 }
 
 function sendDiscoverReply(sock, rinfo, peer) {
+  const live = readLiveLobby();
+  // name[0]=name[3]=load (GetMPMapName = table 33 ; wire=0 → Cathédrale).
+  const { levelTitleIdx, levelLoadIdx } = require("./levels");
+  const titleIdx =
+    live.titleIdx != null
+      ? live.titleIdx
+      : levelTitleIdx(live.modeId, live.mapId);
+  const loadIdx =
+    live.loadIdx != null
+      ? live.loadIdx
+      : live.levelIdx != null
+        ? live.levelIdx
+        : levelLoadIdx(live.modeId, live.mapId);
+  const count = connectedCount(live.maxPlayers);
   send(
     sock,
     buildServerGameDetails({
       magic: GAME_ID,
-      gameMode: GAME_MODE,
-      mapId: MAP_ID,
-      playerCount: connectedCount(),
-      maxPlayers: MAX_PLAYERS,
-      hostName: LOBBY_NAME,
+      gameMode: loadIdx,
+      mapId: loadIdx,
+      playerCount: count,
+      maxPlayers: live.maxPlayers,
+      hostName: live.hostName,
       headerOpts: headerOpts(peer),
     }),
     rinfo,
-    `0x02 ServerGameDetails ${LOBBY.label}`
+    `0x02 ServerGameDetails ${live.label} load=${loadIdx} title=${titleIdx}(off-wire)` +
+      ` name=[${loadIdx},${count},${live.maxPlayers},${loadIdx}] mode=${live.modeId}`
   );
   peer.discoverReplied = true;
 }
 
+/** 0x05+0x16 seulement — 0x10 est injecté par le launcher (évite double StartLoading). */
 function sendJoinSequence(sock, rinfo, peer) {
   if (peer.joined) return;
+  peer.joined = true;
+  const live = readLiveLobby();
   const player = playerFromDetails(peer.details, 0);
   const opts = headerOpts(peer);
 
+  const { levelLoadIdx, levelStreamMode } = require("./levels");
+  const loadIdx =
+    live.loadIdx != null
+      ? live.loadIdx
+      : live.levelIdx != null
+        ? live.levelIdx
+        : levelLoadIdx(live.modeId, live.mapId);
+  const streamMode = levelStreamMode(live.modeId, live.mapId);
   send(
     sock,
     buildLobbyDetails({
       seq: 1,
       descriptor: buildLobbyDescriptor({
-        gameMode: GAME_MODE,
-        mapId: MAP_ID,
-        maxPlayers: MAX_PLAYERS,
+        gameMode: streamMode,
+        mapId: loadIdx,
+        maxPlayers: live.maxPlayers,
         flags: 0,
       }),
       players: [player],
       headerOpts: opts,
     }),
     rinfo,
-    "0x05 LobbyDetails"
+    `0x05 LobbyDetails mode=${live.modeId} load=${loadIdx} retail=${live.mapId}`
   );
   send(
     sock,
@@ -208,13 +296,10 @@ function sendJoinSequence(sock, rinfo, peer) {
     rinfo,
     "0x16 NewPlayer"
   );
-  send(
-    sock,
-    buildStartLoading({ playerId: 0, headerOpts: opts }),
-    rinfo,
-    "0x10 StartLoading"
-  );
-  peer.joined = true;
+  if (peer.loadingTimer) {
+    clearTimeout(peer.loadingTimer);
+    peer.loadingTimer = null;
+  }
 }
 
 function finishClockAndStart(sock, rinfo, peer, clientTime) {
@@ -273,10 +358,11 @@ const sock = dgram.createSocket("udp4");
 
 sock.on("listening", () => {
   const a = sock.address();
+  const live = readLiveLobby();
   console.log(`bb-mp-stub listening UDP ${a.address}:${a.port}`);
   console.log(
-    `lobby="${LOBBY_NAME}" ${LOBBY.label} map=${MAP_ID} mode=${GAME_MODE} ` +
-      `max=${MAX_PLAYERS} gameId=0x${GAME_ID.toString(16)} ping=${PING_MS}ms`
+    `lobby="${live.hostName}" ${live.label} map=${live.mapId} mode=${live.modeId} ` +
+      `max=${live.maxPlayers} gameId=0x${GAME_ID.toString(16)} ping=${PING_MS}ms`
   );
 });
 
@@ -377,24 +463,8 @@ sock.on("message", (msg, rinfo) => {
         }
       }
     }
-    // Echo 0x4D only — NEVER echo 0x17 with the client's pitchByte.
-    // Replaying pitch=199 locked the local camera looking at the floor.
-    if (peer.started || peer.joined) {
-      const env = msgs.find((m) => m.type === 0x4d);
-      const timeMs =
-        env && env.body.length >= 4
-          ? env.body.readUInt32BE(0)
-          : Date.now() & 0xffffffff;
-      send(
-        sock,
-        buildPositionsEnvelope({
-          timeMs,
-          headerOpts: headerOpts(peer),
-        }),
-        rinfo,
-        "0x4D PositionsEcho"
-      );
-    }
+    // Solo host = client autoritatif : pas d'echo 0x4D (snap/saccade) ni 0x17
+    // (pitch=199 → caméra au sol). Log only.
     return;
   }
 
@@ -422,6 +492,7 @@ process.on("SIGINT", () => {
   clearInterval(pingTimer);
   for (const peer of peers.values()) {
     if (peer.clockTimer) clearTimeout(peer.clockTimer);
+    if (peer.loadingTimer) clearTimeout(peer.loadingTimer);
   }
   sock.close();
   process.exit(0);

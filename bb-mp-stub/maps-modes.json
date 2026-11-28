@@ -1,0 +1,45 @@
+{
+  "maps": [
+    { "id": 0, "label": "Cathédrale" },
+    { "id": 1, "label": "Madagascar" },
+    { "id": 2, "label": "Ruines de Madagascar" },
+    { "id": 3, "label": "Quais de Malte" },
+    { "id": 4, "label": "Fort de Malte" },
+    { "id": 5, "label": "Crash OVNI" }
+  ],
+  "modes": [
+    { "id": 0, "label": "Domination" },
+    { "id": 1, "label": "Capture de drapeau" },
+    { "id": 2, "label": "Match à mort" },
+    { "id": 3, "label": "Chacun pour soi" }
+  ],
+  "mapsByMode": {
+    "0": [0, 2, 4, 5],
+    "1": [0, 2, 3, 5],
+    "2": [3, 4, 5],
+    "3": [3, 5]
+  },
+  "levelPlans": {
+    "0": {
+      "0": { "title": 0, "load": 0 },
+      "2": { "title": 3, "load": 12 },
+      "4": { "title": 5, "load": 5 },
+      "5": { "title": 4, "load": 4 }
+    },
+    "1": {
+      "0": { "title": 1, "load": 0 },
+      "2": { "title": 13, "load": 12 },
+      "3": { "title": 11, "load": 11 },
+      "5": { "title": 4, "load": 4 }
+    },
+    "2": {
+      "3": { "title": 10, "load": 10, "streamMode": 3 },
+      "4": { "title": 5, "load": 5, "streamMode": 0 },
+      "5": { "title": 4, "load": 4, "streamMode": 3 }
+    },
+    "3": {
+      "3": { "title": 10, "load": 10 },
+      "5": { "title": 4, "load": 4 }
+    }
+  }
+}
