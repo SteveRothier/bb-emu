@@ -720,6 +720,39 @@ body,
   color: #1a1a1a;
 }
 
+.cfg-hud-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 10px;
+  margin: 0 0 4px;
+  padding: 8px 10px;
+  background: linear-gradient(180deg, rgba(40, 48, 22, 0.92), rgba(28, 34, 16, 0.95));
+  border: 1px solid rgba(184, 201, 138, 0.28);
+  clip-path: polygon(0% 0%, 98% 0%, 100% 100%, 0% 100%);
+}
+
+.cfg-hud-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-family: var(--font-game);
+  font-size: 0.82rem;
+  letter-spacing: 0.02em;
+  color: #e8e0c4;
+  cursor: pointer;
+  user-select: none;
+}
+
+.cfg-hud-item input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: #8a9a48;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
 /* Lobby mode/carte — cycles texte style Blitz Brigade */
 .bb-lobby-select {
   --bb-olive: #4a5a28;

@@ -17,6 +17,18 @@ import type { IconNode } from "lucide";
 import mapsModes from "../bb-mp-stub/maps-modes.json";
 import "./styles.css";
 
+/** Options « cacher » HUD tactile (bitmask côté Rust). */
+type TouchHudHide = {
+  walk: boolean;
+  look: boolean;
+  ads: boolean;
+  jump: boolean;
+  shoot: boolean;
+  anim: boolean;
+  sprint: boolean;
+  sweep: boolean;
+};
+
 type Config = {
   gamePath: string;
   lastLobbyName: string;
@@ -24,7 +36,61 @@ type Config = {
   lastGameMode: number;
   /** Multiplicateur sensibilité souris (1 = défaut packer 0.06). */
   lookSensitivity: number;
+  touchHudHide: TouchHudHide;
 };
+
+/** Défaut = config actuelle (sticks/œil/viseur/saut/tir/anim ; sprint+demi-tour visibles). */
+const DEFAULT_TOUCH_HUD_HIDE: TouchHudHide = {
+  walk: true,
+  look: true,
+  ads: true,
+  jump: true,
+  shoot: true,
+  anim: true,
+  sprint: false,
+  sweep: false,
+};
+
+const TOUCH_HUD_BITS = {
+  walk: 1 << 0,
+  look: 1 << 1,
+  ads: 1 << 2,
+  jump: 1 << 3,
+  shoot: 1 << 4,
+  anim: 1 << 5,
+  sprint: 1 << 6,
+  sweep: 1 << 7,
+} as const;
+
+const TOUCH_HUD_KEYS = Object.keys(TOUCH_HUD_BITS) as (keyof TouchHudHide)[];
+
+const TOUCH_HUD_LABELS: Record<keyof TouchHudHide, string> = {
+  walk: "Déplacement",
+  look: "Regard / œil",
+  ads: "Viseur",
+  jump: "Saut",
+  shoot: "Tir",
+  anim: "Anim",
+  sprint: "Sprint",
+  sweep: "Demi-tour",
+};
+
+function touchHudMask(h: TouchHudHide): number {
+  let m = 0;
+  for (const k of TOUCH_HUD_KEYS) {
+    if (h[k]) m |= TOUCH_HUD_BITS[k];
+  }
+  return m;
+}
+
+function normalizeTouchHudHide(raw: unknown): TouchHudHide {
+  const src = raw && typeof raw === "object" ? (raw as Partial<TouchHudHide>) : {};
+  const out = { ...DEFAULT_TOUCH_HUD_HIDE };
+  for (const k of TOUCH_HUD_KEYS) {
+    if (typeof src[k] === "boolean") out[k] = src[k]!;
+  }
+  return out;
+}
 
 const DEFAULT_CONFIG: Config = {
   gamePath: "",
@@ -32,6 +98,7 @@ const DEFAULT_CONFIG: Config = {
   lastMapId: 0, // Cathédrale (wire)
   lastGameMode: 0, // Domination
   lookSensitivity: 1,
+  touchHudHide: { ...DEFAULT_TOUCH_HUD_HIDE },
 };
 
 /** Source unique : bb-mp-stub/maps-modes.json (aussi lu par levels.js). */
@@ -82,7 +149,7 @@ function mountIcon(target: Element, node: IconNode, size = 16) {
 function loadConfig(): Config {
   try {
     const raw = localStorage.getItem("bb-emu-config");
-    if (!raw) return { ...DEFAULT_CONFIG };
+    if (!raw) return { ...DEFAULT_CONFIG, touchHudHide: { ...DEFAULT_TOUCH_HUD_HIDE } };
     const parsed = JSON.parse(raw) as Partial<Config>;
     const sens = Number(parsed.lookSensitivity);
     return {
@@ -96,9 +163,10 @@ function loadConfig(): Config {
       lookSensitivity: Number.isFinite(sens)
         ? Math.max(0.25, Math.min(3, sens))
         : DEFAULT_CONFIG.lookSensitivity,
+      touchHudHide: normalizeTouchHudHide(parsed.touchHudHide),
     };
   } catch {
-    return { ...DEFAULT_CONFIG };
+    return { ...DEFAULT_CONFIG, touchHudHide: { ...DEFAULT_TOUCH_HUD_HIDE } };
   }
 }
 
@@ -238,6 +306,9 @@ app.innerHTML = `
           <span class="cfg-sens-val" id="cfg-look-sens-val">100%</span>
         </label>
 
+        <p class="cfg-kicker">HUD tactile — cacher</p>
+        <div class="cfg-hud-grid" id="cfg-touch-hud" role="group" aria-label="Icônes HUD à cacher"></div>
+
         <div class="config-actions">
           <button class="bb-btn bb-tan bb-sm" id="btn-party-toggle" type="button">
             <span id="btn-party-toggle-label">Créer</span>
@@ -282,7 +353,21 @@ const cfgMapPrev = document.querySelector<HTMLButtonElement>("#cfg-map-prev")!;
 const cfgMapNext = document.querySelector<HTMLButtonElement>("#cfg-map-next")!;
 const cfgLookSens = document.querySelector<HTMLInputElement>("#cfg-look-sens")!;
 const cfgLookSensVal = document.querySelector<HTMLElement>("#cfg-look-sens-val")!;
+const cfgTouchHud = document.querySelector<HTMLElement>("#cfg-touch-hud")!;
 const cfgGameBtn = document.querySelector<HTMLButtonElement>("#cfg-game-btn")!;
+
+for (const key of TOUCH_HUD_KEYS) {
+  const lab = document.createElement("label");
+  lab.className = "cfg-hud-item";
+  const input = document.createElement("input");
+  input.type = "checkbox";
+  input.id = `cfg-hud-${key}`;
+  input.dataset.hud = key;
+  const span = document.createElement("span");
+  span.textContent = TOUCH_HUD_LABELS[key];
+  lab.append(input, span);
+  cfgTouchHud.append(lab);
+}
 
 /** Sélection courante mode/carte (wire ids). */
 let draftModeId = 0;
@@ -439,6 +524,22 @@ cfgModeNext.addEventListener("click", () => cycleMode(1));
 cfgMapPrev.addEventListener("click", () => cycleMap(-1));
 cfgMapNext.addEventListener("click", () => cycleMap(1));
 
+function readTouchHudHideFromUi(): TouchHudHide {
+  const out = { ...DEFAULT_TOUCH_HUD_HIDE };
+  for (const key of TOUCH_HUD_KEYS) {
+    const el = document.querySelector<HTMLInputElement>(`#cfg-hud-${key}`);
+    out[key] = el?.checked ?? DEFAULT_TOUCH_HUD_HIDE[key];
+  }
+  return out;
+}
+
+function fillTouchHudUi(h: TouchHudHide) {
+  for (const key of TOUCH_HUD_KEYS) {
+    const el = document.querySelector<HTMLInputElement>(`#cfg-hud-${key}`);
+    if (el) el.checked = h[key];
+  }
+}
+
 function fillDraftFromConfig() {
   cfgName.value = (config.lastLobbyName || DEFAULT_CONFIG.lastLobbyName).slice(0, LOBBY_MAX_LEN);
   draftModeId = MODE_OPTIONS.some((m) => m.id === config.lastGameMode)
@@ -450,15 +551,18 @@ function fillDraftFromConfig() {
   const pct = Math.round((config.lookSensitivity || 1) * 100);
   cfgLookSens.value = String(Math.max(25, Math.min(300, pct)));
   cfgLookSensVal.textContent = `${cfgLookSens.value}%`;
+  fillTouchHudUi(config.touchHudHide ?? DEFAULT_TOUCH_HUD_HIDE);
   syncNameCount();
 }
 
 async function pushLookSettings() {
   const sensitivity = Math.max(0.25, Math.min(3, Number(cfgLookSens.value) / 100 || 1));
-  config = { ...config, lookSensitivity: sensitivity };
+  const touchHudHide = readTouchHudHideFromUi();
+  config = { ...config, lookSensitivity: sensitivity, touchHudHide };
   saveConfig(config);
   try {
     await invoke("set_look_settings", { sensitivity });
+    await invoke("set_touch_hud_settings", { mask: touchHudMask(touchHudHide) });
   } catch {
     /* ignore — watcher peut être hors Windows */
   }
@@ -509,6 +613,9 @@ cfgLookSens.addEventListener("input", () => {
   cfgLookSensVal.textContent = `${cfgLookSens.value}%`;
 });
 cfgLookSens.addEventListener("change", () => {
+  void pushLookSettings();
+});
+cfgTouchHud.addEventListener("change", () => {
   void pushLookSettings();
 });
 
@@ -670,6 +777,7 @@ function persistDraft(lobby?: {
     lastMapId: L.mapId,
     lastGameMode: L.gameMode,
     lookSensitivity: Math.max(0.25, Math.min(3, Number(cfgLookSens.value) / 100 || 1)),
+    touchHudHide: readTouchHudHideFromUi(),
   };
   saveConfig(config);
   cfgGameText.textContent = shortPath(config.gamePath);

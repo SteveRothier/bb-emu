@@ -2249,6 +2249,36 @@ fn set_look_settings(sensitivity: f32) {
     let _ = (sensitivity, scale);
 }
 
+/// Bits HUD tactile (1 = cacher). Défaut = sticks/œil/ADS/saut/tir/anim.
+const TOUCH_HUD_WALK: u32 = 1 << 0;
+const TOUCH_HUD_LOOK: u32 = 1 << 1;
+const TOUCH_HUD_ADS: u32 = 1 << 2;
+const TOUCH_HUD_JUMP: u32 = 1 << 3;
+const TOUCH_HUD_SHOOT: u32 = 1 << 4;
+const TOUCH_HUD_ANIM: u32 = 1 << 5;
+const TOUCH_HUD_SPRINT: u32 = 1 << 6;
+const TOUCH_HUD_SWEEP: u32 = 1 << 7;
+const TOUCH_HUD_DEFAULT: u32 = TOUCH_HUD_WALK
+    | TOUCH_HUD_LOOK
+    | TOUCH_HUD_ADS
+    | TOUCH_HUD_JUMP
+    | TOUCH_HUD_SHOOT
+    | TOUCH_HUD_ANIM;
+
+#[cfg(windows)]
+static TOUCH_HUD_MASK: AtomicU32 = AtomicU32::new(TOUCH_HUD_DEFAULT);
+
+#[tauri::command]
+fn set_touch_hud_settings(mask: u32) {
+    let mask = mask & 0xFF;
+    #[cfg(windows)]
+    {
+        TOUCH_HUD_MASK.store(mask, Ordering::Relaxed);
+        sync_touch_hud_mask_to_game(mask);
+    }
+    let _ = mask;
+}
+
 #[cfg(windows)]
 fn read_u32_at(process: *mut std::ffi::c_void, addr: u64) -> Option<u32> {
     let mut b = [0u8; 4];
@@ -3334,19 +3364,645 @@ fn restore_abs_look_no_center(process: *mut std::ffi::c_void, image: u32) -> Res
     patch_code(process, image, 0x2E317D, &[0xEB, 0x5F], &[0x74, 0x5F])
 }
 
-/// Masque le stick UI tactile (look). Ne pas armer en match : casse le sprint
-/// (AnalogJoystick partage IsActive @0x46D070).
+/// LevelInterface parent singleton (RVA) → obj+0x44 = LevelInterface*.
+const LEVEL_IFACE_PARENT_RVA: u32 = 0x9A3D04;
+/// LevelInterface vtable RVA (image-relative).
+const LEVEL_IFACE_VTBL_RVA: u32 = 0x97352C;
+
+const VTBL_LOOK_ROTATE: u32 = 0x972FB4; // FullScreenRotateJoystick
+const VTBL_ANALOG: u32 = 0x978830;
+const VTBL_WALK: u32 = 0x9788C4;
+const VTBL_MOBILE_ANALOG: u32 = 0x9789F4;
+const VTBL_CBUTTON_ANIM: u32 = 0x977E1C;
+const VTBL_CBUTTON_SHOOT: u32 = 0x978964;
+const VTBL_FULLSCREEN_SHOOT: u32 = 0x978A84;
+const VTBL_CBUTTON_SPR: u32 = 0x977D8C;
+const VTBL_CBUTTON_SWEEP: u32 = 0x977EAC;
+
+const SPR_JUMP_IDS: &[u32] = &[0x14, 0x15];
+const SPR_ADS_IDS: &[u32] = &[0x88, 0x89];
+const SPR_RUSH_IDS: &[u32] = &[0x143, 0x144, 0x158, 0x159];
+
 #[cfg(windows)]
-#[allow(dead_code)]
-fn disable_touch_controls(process: *mut std::ffi::c_void, image: u32) -> Result<(), String> {
-    // FullScreenRotateJoystick::IsActive → toujours faux (pas de dessin stick).
-    patch_code(
+fn ctrl_vtbl_rva(process: *mut std::ffi::c_void, image: u32, ctrl: u32) -> Option<u32> {
+    let vt = read_u32_at(process, ctrl as u64)?;
+    Some(vt.wrapping_sub(image))
+}
+
+#[cfg(windows)]
+fn ctrl_pos_xy(process: *mut std::ffi::c_void, ctrl: u32) -> Option<(i16, i16)> {
+    let mut buf = [0u8; 4];
+    read_bytes(process, ctrl as u64 + 0x38, &mut buf).ok()?;
+    let x = i16::from_le_bytes([buf[0], buf[1]]);
+    let y = i16::from_le_bytes([buf[2], buf[3]]);
+    Some((x, y))
+}
+
+#[cfg(windows)]
+fn ctrl_spr_icon_ids(process: *mut std::ffi::c_void, ctrl: u32) -> Option<(u32, u32)> {
+    let a = read_u32_at(process, ctrl as u64 + 0x90)?;
+    let b = read_u32_at(process, ctrl as u64 + 0x94)?;
+    Some((a, b))
+}
+
+/// Bit HUD pour ce contrôle, si géré par les options launcher.
+#[cfg(windows)]
+fn ctrl_touch_hud_bit(process: *mut std::ffi::c_void, ctrl: u32, rva: u32) -> Option<u32> {
+    match rva {
+        VTBL_WALK => Some(TOUCH_HUD_WALK),
+        VTBL_ANALOG | VTBL_LOOK_ROTATE | VTBL_MOBILE_ANALOG => Some(TOUCH_HUD_LOOK),
+        VTBL_FULLSCREEN_SHOOT | VTBL_CBUTTON_SHOOT => Some(TOUCH_HUD_SHOOT),
+        VTBL_CBUTTON_ANIM => Some(TOUCH_HUD_ANIM),
+        VTBL_CBUTTON_SWEEP => Some(TOUCH_HUD_SWEEP),
+        VTBL_CBUTTON_SPR => {
+            let (a, b) = ctrl_spr_icon_ids(process, ctrl)?;
+            if SPR_JUMP_IDS.contains(&a) || SPR_JUMP_IDS.contains(&b) {
+                Some(TOUCH_HUD_JUMP)
+            } else if SPR_ADS_IDS.contains(&a) || SPR_ADS_IDS.contains(&b) {
+                Some(TOUCH_HUD_ADS)
+            } else if SPR_RUSH_IDS.contains(&a) || SPR_RUSH_IDS.contains(&b) {
+                Some(TOUCH_HUD_SPRINT)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn should_hide_ctrl(process: *mut std::ffi::c_void, image: u32, ctrl: u32, rva: u32) -> bool {
+    let _ = image;
+    let Some(bit) = ctrl_touch_hud_bit(process, ctrl, rva) else {
+        return false;
+    };
+    TOUCH_HUD_MASK.load(Ordering::Relaxed) & bit != 0
+}
+
+#[cfg(windows)]
+fn sync_touch_hud_mask_to_game(mask: u32) {
+    let cave = TOUCH_HIDE_CAVE.load(Ordering::Relaxed);
+    let Some((pid, _)) = FPS_LOOK_STATE.lock().ok().and_then(|g| *g) else {
+        return;
+    };
+    if cave == 0 || pid == 0 {
+        return;
+    }
+    let process = unsafe { OpenProcess(0x1F0FFF, 0, pid) };
+    if process.is_null() {
+        return;
+    }
+    let _ = write_exact(process, cave as u64 + CAVE_OFF_MASK as u64, &mask.to_le_bytes());
+    unsafe {
+        CloseHandle(process);
+    }
+}
+
+/// LevelInterface* via `[image+0x9A3D04]+0x44`.
+#[cfg(windows)]
+fn resolve_level_interface(process: *mut std::ffi::c_void, image: u32) -> Option<u32> {
+    let parent = read_u32_at(process, image as u64 + LEVEL_IFACE_PARENT_RVA as u64)?;
+    if parent < 0x10000 {
+        return None;
+    }
+    let iface = read_u32_at(process, parent as u64 + 0x44)?;
+    if iface < 0x10000 {
+        return None;
+    }
+    let vt = read_u32_at(process, iface as u64)?;
+    let rva = vt.wrapping_sub(image);
+    if rva != LEVEL_IFACE_VTBL_RVA {
+        // Accepte si +0x198 ressemble à une table de contrôles.
+        let arr = read_u32_at(process, iface as u64 + 0x198)?;
+        if arr < 0x10000 {
+            return None;
+        }
+    }
+    Some(iface)
+}
+
+/// Applique le masque HUD (flags + scale). Ne null jamais +0x198 (crash offsets fixes).
+/// Ne touche jamais IsActive (+0x1D / @0x46D070).
+#[cfg(windows)]
+fn hide_touch_controls_runtime(process: *mut std::ffi::c_void, image: u32) -> u32 {
+    let Some(iface) = resolve_level_interface(process, image) else {
+        return 0;
+    };
+    let Some(arr) = read_u32_at(process, iface as u64 + 0x198) else {
+        return 0;
+    };
+    if arr < 0x10000 {
+        return 0;
+    }
+    let mut hidden = 0u32;
+    let one = 1f32.to_le_bytes();
+    let zero_f = 0f32.to_le_bytes();
+    for i in 0u32..0x40 {
+        let Some(ctrl) = read_u32_at(process, arr as u64 + (i as u64) * 4) else {
+            continue;
+        };
+        if ctrl < 0x10000 {
+            continue;
+        }
+        let Some(rva) = ctrl_vtbl_rva(process, image, ctrl) else {
+            continue;
+        };
+        let Some(_bit) = ctrl_touch_hud_bit(process, ctrl, rva) else {
+            continue;
+        };
+        if should_hide_ctrl(process, image, ctrl, rva) {
+            let _ = write_exact(process, ctrl as u64 + 0x1F, &[0u8]);
+            let _ = write_exact(process, ctrl as u64 + 0x20, &[0u8]);
+            let _ = write_exact(process, ctrl as u64 + 0x21, &[0u8]);
+            let _ = write_exact(process, ctrl as u64 + 0x3C, &zero_f);
+            // Hors écran (sans nuller le slot — safe).
+            let _ = write_exact(process, ctrl as u64 + 0x38, &(-8000i16).to_le_bytes());
+            let _ = write_exact(process, ctrl as u64 + 0x3A, &(-8000i16).to_le_bytes());
+            hidden += 1;
+        } else {
+            // Option décochée : flags/scale visibles (position laissée au jeu).
+            let _ = write_exact(process, ctrl as u64 + 0x1F, &[1u8]);
+            let _ = write_exact(process, ctrl as u64 + 0x20, &[1u8]);
+            let _ = write_exact(process, ctrl as u64 + 0x21, &[1u8]);
+            let _ = write_exact(process, ctrl as u64 + 0x3C, &one);
+        }
+    }
+    hidden
+}
+
+/// Log one-shot des vtables + pos (debug Spr gauche/droite).
+#[cfg(windows)]
+fn log_touch_ctrl_vtbls(app: &AppHandle, process: *mut std::ffi::c_void, image: u32) {
+    let Some(iface) = resolve_level_interface(process, image) else {
+        append_log(app, "fps-mouse: LevelInterface introuvable");
+        return;
+    };
+    let Some(arr) = read_u32_at(process, iface as u64 + 0x198) else {
+        return;
+    };
+    if arr < 0x10000 {
+        return;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for i in 0u32..0x40 {
+        let Some(ctrl) = read_u32_at(process, arr as u64 + (i as u64) * 4) else {
+            continue;
+        };
+        if ctrl < 0x10000 {
+            continue;
+        }
+        let Some(rva) = ctrl_vtbl_rva(process, image, ctrl) else {
+            continue;
+        };
+        let mut b = [0u8; 3];
+        let _ = read_bytes(process, ctrl as u64 + 0x1F, &mut b);
+        let (x, y) = ctrl_pos_xy(process, ctrl).unwrap_or((0, 0));
+        let icons = ctrl_spr_icon_ids(process, ctrl)
+            .map(|(a, b)| format!("{a:X}/{b:X}"))
+            .unwrap_or_else(|| "-".into());
+        let mark = if should_hide_ctrl(process, image, ctrl, rva) {
+            "*"
+        } else {
+            ""
+        };
+        parts.push(format!(
+            "{i}:{:05X}@{x},{y}#{icons}/{:02X}{:02X}{:02X}{mark}",
+            rva, b[0], b[1], b[2]
+        ));
+    }
+    if parts.is_empty() {
+        append_log(app, "fps-mouse: touch slots vides");
+    } else {
+        append_log(
+            app,
+            &format!("fps-mouse: touch slots {}", parts.join(" ")),
+        );
+    }
+}
+
+/// Page cave touch-hide (setVisible / setEnabled / IsVisible / getVisible).
+static TOUCH_HIDE_CAVE: AtomicU32 = AtomicU32::new(0);
+
+const SETVISIBLE_RVA: u32 = 0x3E8D20;
+const SETVISIBLE_ORIG: [u8; 5] = [0x55, 0x8B, 0xEC, 0x8B, 0xD1];
+const SETENABLED_RVA: u32 = 0x3EEB60; // 7eeb60 — écrit +0x20
+const SETENABLED_ORIG: [u8; 5] = [0x55, 0x8B, 0xEC, 0x80, 0x7D];
+const ISVISIBLE_RVA: u32 = 0x3F4B60; // 7f4b60
+const ISVISIBLE_ORIG: [u8; 5] = [0x80, 0x79, 0x20, 0x00, 0x74];
+const GETVISIBLE_RVA: u32 = 0x2E3050; // 6e3050
+const GETVISIBLE_ORIG: [u8; 5] = [0x8A, 0x41, 0x21, 0xC3, 0xCC];
+/// Draw commun (vtbl+0x60) : lit +0x20 en direct → filet anti-flash si unlink trop tard.
+const DRAW_BTN_RVA: u32 = 0x3E9220;
+const DRAW_BTN_ORIG: [u8; 6] = [0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x60];
+
+const CAVE_OFF_SHOULD: u32 = 0x000;
+const CAVE_OFF_MASK: u32 = 0x1F8; // u32 masque HUD (lu par should_hide)
+const CAVE_OFF_SETVIS: u32 = 0x200;
+const CAVE_OFF_SETEN: u32 = 0x300;
+const CAVE_OFF_ISVIS: u32 = 0x400;
+const CAVE_OFF_GETVIS: u32 = 0x480;
+const CAVE_OFF_DRAWBTN: u32 = 0x500;
+
+/// Annule d'anciens patches globaux (hors cave active).
+#[cfg(windows)]
+fn restore_touch_controls(process: *mut std::ffi::c_void, image: u32) {
+    let _ = patch_code(
         process,
         image,
-        0x46D070,
-        &[0x8A, 0x41, 0x1D, 0xC3],
-        &[0x32, 0xC0, 0xC3, 0x90],
-    )?;
+        0x2FA786,
+        &[0xC6, 0x45, 0x08, 0x00],
+        &[0x80, 0x7D, 0x08, 0x00],
+    );
+    // Ancien anti-flash LevelInterface push0 (cassait le demi-tour) → toujours retirer.
+    let _ = patch_code(
+        process,
+        image,
+        0x2FA822,
+        &[0x6A, 0x00, 0x90],
+        &[0xFF, 0x75, 0x08],
+    );
+    if TOUCH_HIDE_CAVE.load(Ordering::Relaxed) == 0 {
+        let _ = patch_code(
+            process,
+            image,
+            GETVISIBLE_RVA,
+            &[0x32, 0xC0, 0xC3, 0x90],
+            &[0x8A, 0x41, 0x21, 0xC3],
+        );
+        let _ = patch_code(
+            process,
+            image,
+            SETVISIBLE_RVA,
+            &[0xC6, 0x41, 0x21, 0x00, 0xC2, 0x04, 0x00],
+            &[0x55, 0x8B, 0xEC, 0x8B, 0xD1, 0x53, 0x8A],
+        );
+        let _ = patch_code(
+            process,
+            image,
+            ISVISIBLE_RVA,
+            &[0x32, 0xC0, 0xC3, 0x90, 0x90, 0x90, 0x90],
+            &[0x80, 0x79, 0x20, 0x00, 0x74, 0x09, 0x80],
+        );
+    }
+}
+
+/// `should_hide(this=ecx) -> al` — lit le masque absolu `[mask_abs]`.
+#[cfg(windows)]
+fn build_should_hide_fn(image: u32, mask_abs: u32) -> Vec<u8> {
+    let mut code = Vec::with_capacity(320);
+    let mut je_yes: Vec<usize> = Vec::new();
+    let mut jz_patches: Vec<(usize, usize)> = Vec::new(); // (jz_disp_off, target_after)
+
+    // mov edx, [mask_abs]
+    code.extend_from_slice(&[0x8B, 0x15]);
+    code.extend_from_slice(&mask_abs.to_le_bytes());
+
+    let emit_vtbl = |code: &mut Vec<u8>,
+                     je_yes: &mut Vec<usize>,
+                     jz_patches: &mut Vec<(usize, usize)>,
+                     bit: u32,
+                     rva: u32| {
+        // test edx, bit ; jz skip
+        code.extend_from_slice(&[0xF7, 0xC2]);
+        code.extend_from_slice(&bit.to_le_bytes());
+        let jz_at = code.len();
+        code.extend_from_slice(&[0x74, 0x00]);
+        // cmp [ecx], vtbl ; je yes
+        let abs = image.wrapping_add(rva);
+        code.extend_from_slice(&[0x81, 0x39]);
+        code.extend_from_slice(&abs.to_le_bytes());
+        je_yes.push(code.len());
+        code.extend_from_slice(&[0x0F, 0x84, 0, 0, 0, 0]);
+        jz_patches.push((jz_at + 1, code.len()));
+    };
+
+    emit_vtbl(
+        &mut code,
+        &mut je_yes,
+        &mut jz_patches,
+        TOUCH_HUD_WALK,
+        VTBL_WALK,
+    );
+    for &rva in &[VTBL_ANALOG, VTBL_LOOK_ROTATE, VTBL_MOBILE_ANALOG] {
+        emit_vtbl(
+            &mut code,
+            &mut je_yes,
+            &mut jz_patches,
+            TOUCH_HUD_LOOK,
+            rva,
+        );
+    }
+    for &rva in &[VTBL_FULLSCREEN_SHOOT, VTBL_CBUTTON_SHOOT] {
+        emit_vtbl(
+            &mut code,
+            &mut je_yes,
+            &mut jz_patches,
+            TOUCH_HUD_SHOOT,
+            rva,
+        );
+    }
+    emit_vtbl(
+        &mut code,
+        &mut je_yes,
+        &mut jz_patches,
+        TOUCH_HUD_ANIM,
+        VTBL_CBUTTON_ANIM,
+    );
+    emit_vtbl(
+        &mut code,
+        &mut je_yes,
+        &mut jz_patches,
+        TOUCH_HUD_SWEEP,
+        VTBL_CBUTTON_SWEEP,
+    );
+
+    // CButtonSpr icons (Jump / ADS / Sprint) — bit + vtbl + icon id.
+    let spr_abs = image.wrapping_add(VTBL_CBUTTON_SPR);
+    let spr_groups: &[(u32, &[u32])] = &[
+        (TOUCH_HUD_JUMP, SPR_JUMP_IDS),
+        (TOUCH_HUD_ADS, SPR_ADS_IDS),
+        (TOUCH_HUD_SPRINT, SPR_RUSH_IDS),
+    ];
+    for &(bit, ids) in spr_groups {
+        code.extend_from_slice(&[0xF7, 0xC2]);
+        code.extend_from_slice(&bit.to_le_bytes());
+        let jz_at = code.len();
+        code.extend_from_slice(&[0x74, 0x00]);
+        // cmp [ecx], spr_vtbl ; jne skip_group
+        code.extend_from_slice(&[0x81, 0x39]);
+        code.extend_from_slice(&spr_abs.to_le_bytes());
+        let jne_at = code.len();
+        code.extend_from_slice(&[0x75, 0x00]);
+        for off in [0x90u32, 0x94u32] {
+            for &id in ids {
+                code.extend_from_slice(&[0x81, 0xB9]);
+                code.extend_from_slice(&off.to_le_bytes());
+                code.extend_from_slice(&id.to_le_bytes());
+                je_yes.push(code.len());
+                code.extend_from_slice(&[0x0F, 0x84, 0, 0, 0, 0]);
+            }
+        }
+        let after = code.len();
+        let jz_rel = (after as i32) - ((jz_at + 2) as i32);
+        code[jz_at + 1] = jz_rel as u8;
+        let jne_rel = (after as i32) - ((jne_at + 2) as i32);
+        code[jne_at + 1] = jne_rel as u8;
+    }
+
+    for (disp_off, after) in jz_patches {
+        let rel = (after as i32) - ((disp_off + 1) as i32);
+        code[disp_off] = rel as u8;
+    }
+
+    // no
+    code.extend_from_slice(&[0x32, 0xC0, 0xC3]);
+    let yes = code.len();
+    for at in je_yes {
+        let rel = (yes as i32) - ((at + 6) as i32);
+        code[at + 2..at + 6].copy_from_slice(&rel.to_le_bytes());
+    }
+    code.extend_from_slice(&[0xB0, 0x01, 0xC3]);
+    debug_assert!(
+        code.len() < CAVE_OFF_MASK as usize,
+        "should_hide trop long: {}",
+        code.len()
+    );
+    code
+}
+
+#[cfg(windows)]
+fn emit_e9(code: &mut Vec<u8>, patches: &mut Vec<(usize, u32)>, target: u32) {
+    let at = code.len();
+    code.push(0xE9);
+    code.extend_from_slice(&[0, 0, 0, 0]);
+    patches.push((at + 1, target));
+}
+
+#[cfg(windows)]
+fn emit_e8(code: &mut Vec<u8>, patches: &mut Vec<(usize, u32)>, target: u32) {
+    let at = code.len();
+    code.push(0xE8);
+    code.extend_from_slice(&[0, 0, 0, 0]);
+    patches.push((at + 1, target));
+}
+
+#[cfg(windows)]
+fn apply_rel_patches(code: &mut [u8], cave_base: u32, patches: &[(usize, u32)]) {
+    for &(off, target) in patches {
+        let insn = cave_base.wrapping_add(off as u32 - 1);
+        let rel = enc_rel32(insn, target);
+        code[off..off + 4].copy_from_slice(&rel);
+    }
+}
+
+/// setVisible stub : si hide → clear flags + arg=0, puis prologue d’origine.
+#[cfg(windows)]
+fn build_setvisible_stub(cave_base: u32, image: u32, site: u32) -> Vec<u8> {
+    let should = cave_base.wrapping_add(CAVE_OFF_SHOULD);
+    let mut code = Vec::with_capacity(64);
+    let mut patches = Vec::new();
+    // push ebp; mov ebp, esp
+    code.extend_from_slice(&[0x55, 0x8B, 0xEC]);
+    emit_e8(&mut code, &mut patches, should);
+    // test al,al ; jz keep (+16 = force block)
+    code.extend_from_slice(&[0x84, 0xC0, 0x74, 0x10]);
+    code.extend_from_slice(&[0xC6, 0x45, 0x08, 0x00]);
+    code.extend_from_slice(&[0xC6, 0x41, 0x1F, 0x00]);
+    code.extend_from_slice(&[0xC6, 0x41, 0x20, 0x00]);
+    code.extend_from_slice(&[0xC6, 0x41, 0x21, 0x00]);
+    // keep: mov edx, ecx ; jmp site+5
+    code.extend_from_slice(&[0x8B, 0xD1]);
+    emit_e9(&mut code, &mut patches, site.wrapping_add(5));
+    apply_rel_patches(&mut code, cave_base.wrapping_add(CAVE_OFF_SETVIS), &patches);
+    let _ = image;
+    code
+}
+
+/// setEnabled stub (écrit +0x20) : si hide → arg=0, jmp après le cmp d’origine.
+#[cfg(windows)]
+fn build_setenabled_stub(cave_base: u32, site: u32) -> Vec<u8> {
+    let should = cave_base.wrapping_add(CAVE_OFF_SHOULD);
+    let mut code = Vec::with_capacity(48);
+    let mut patches = Vec::new();
+    // push ebp; mov ebp, esp
+    code.extend_from_slice(&[0x55, 0x8B, 0xEC]);
+    emit_e8(&mut code, &mut patches, should);
+    // test al,al ; jz keep (+8)
+    code.extend_from_slice(&[0x84, 0xC0, 0x74, 0x08]);
+    code.extend_from_slice(&[0xC6, 0x45, 0x08, 0x00]);
+    code.extend_from_slice(&[0xC6, 0x41, 0x20, 0x00]);
+    // keep: cmp [ebp+8],0 ; jmp site+7 (après `55 8B EC 80 7D 08 00`)
+    code.extend_from_slice(&[0x80, 0x7D, 0x08, 0x00]);
+    emit_e9(&mut code, &mut patches, site.wrapping_add(7));
+    apply_rel_patches(&mut code, cave_base.wrapping_add(CAVE_OFF_SETEN), &patches);
+    code
+}
+
+/// IsVisible : si hide → return 0, sinon logique d’origine.
+#[cfg(windows)]
+fn build_isvisible_stub(cave_base: u32) -> Vec<u8> {
+    let should = cave_base.wrapping_add(CAVE_OFF_SHOULD);
+    let mut code = Vec::with_capacity(32);
+    let mut patches = Vec::new();
+    emit_e8(&mut code, &mut patches, should);
+    // test al,al ; jz orig ; xor al,al ; ret
+    code.extend_from_slice(&[0x84, 0xC0, 0x74, 0x03, 0x32, 0xC0, 0xC3]);
+    code.extend_from_slice(&[
+        0x80, 0x79, 0x20, 0x00, 0x74, 0x09, 0x80, 0x79, 0x1F, 0x00, 0x74, 0x03, 0xB0, 0x01, 0xC3,
+        0x32, 0xC0, 0xC3,
+    ]);
+    apply_rel_patches(&mut code, cave_base.wrapping_add(CAVE_OFF_ISVIS), &patches);
+    code
+}
+
+/// getVisible (+0x21) : si hide → 0.
+#[cfg(windows)]
+fn build_getvisible_stub(cave_base: u32) -> Vec<u8> {
+    let should = cave_base.wrapping_add(CAVE_OFF_SHOULD);
+    let mut code = Vec::with_capacity(16);
+    let mut patches = Vec::new();
+    emit_e8(&mut code, &mut patches, should);
+    code.extend_from_slice(&[0x84, 0xC0, 0x74, 0x03, 0x32, 0xC0, 0xC3]);
+    code.extend_from_slice(&[0x8A, 0x41, 0x21, 0xC3]);
+    apply_rel_patches(&mut code, cave_base.wrapping_add(CAVE_OFF_GETVIS), &patches);
+    code
+}
+
+/// Draw : si hide → clear +0x1F/20/21 et `ret` (jamais de rendu → anti-flash).
+#[cfg(windows)]
+fn build_draw_stub(cave_base: u32, cave_off: u32, site: u32, stolen: &[u8]) -> Vec<u8> {
+    let should = cave_base.wrapping_add(CAVE_OFF_SHOULD);
+    let mut code = Vec::with_capacity(48);
+    let mut patches = Vec::new();
+    emit_e8(&mut code, &mut patches, should);
+    // test al,al ; jz keep (+13)
+    code.extend_from_slice(&[0x84, 0xC0, 0x74, 0x0D]);
+    code.extend_from_slice(&[0xC6, 0x41, 0x1F, 0x00]);
+    code.extend_from_slice(&[0xC6, 0x41, 0x20, 0x00]);
+    code.extend_from_slice(&[0xC6, 0x41, 0x21, 0x00]);
+    code.push(0xC3); // ret — ne dessine pas
+    // keep: octets volés + jmp site+len
+    code.extend_from_slice(stolen);
+    emit_e9(
+        &mut code,
+        &mut patches,
+        site.wrapping_add(stolen.len() as u32),
+    );
+    apply_rel_patches(&mut code, cave_base.wrapping_add(cave_off), &patches);
+    code
+}
+
+#[cfg(windows)]
+fn hook_site_jmp(
+    process: *mut std::ffi::c_void,
+    site: u32,
+    cave_entry: u32,
+    expected: &[u8],
+) -> Result<(), String> {
+    if expected.len() < 5 {
+        return Err(format!("site {site:08X} expected trop court"));
+    }
+    let mut cur = vec![0u8; expected.len()];
+    if read_bytes(process, site as u64, &mut cur).is_err() {
+        return Err(format!("lecture site {site:08X} KO"));
+    }
+    if cur[0] == 0xE9 {
+        return Ok(());
+    }
+    if cur.as_slice() != expected {
+        return Err(format!(
+            "site {site:08X} octets inattendus: {}",
+            hex_bytes(&cur)
+        ));
+    }
+    let mut hook = vec![0x90u8; expected.len()];
+    hook[0] = 0xE9;
+    hook[1..5].copy_from_slice(&enc_rel32(site, cave_entry));
+    let page = (site as u64) & !0xFFF;
+    let mut old = 0u32;
+    if unsafe { VirtualProtectEx(process, page, 0x1000, 0x40, &mut old) } == 0 {
+        return Err(format!("VirtualProtectEx {site:08X} KO"));
+    }
+    let wrote = write_exact(process, site as u64, &hook);
+    unsafe { VirtualProtectEx(process, page, 0x1000, old, &mut old) };
+    wrote.map_err(|_| format!("hook write {site:08X} KO"))
+}
+
+#[cfg(windows)]
+fn restore_site_bytes(process: *mut std::ffi::c_void, site: u32, orig: &[u8]) {
+    let page = (site as u64) & !0xFFF;
+    let mut old = 0u32;
+    if unsafe { VirtualProtectEx(process, page, 0x1000, 0x40, &mut old) } != 0 {
+        let _ = write_exact(process, site as u64, orig);
+        unsafe { VirtualProtectEx(process, page, 0x1000, old, &mut old) };
+    }
+}
+
+#[cfg(windows)]
+fn rollback_touch_hide_sites(process: *mut std::ffi::c_void, image: u32) {
+    restore_site_bytes(process, image.wrapping_add(SETVISIBLE_RVA), &SETVISIBLE_ORIG);
+    restore_site_bytes(process, image.wrapping_add(SETENABLED_RVA), &SETENABLED_ORIG);
+    restore_site_bytes(process, image.wrapping_add(ISVISIBLE_RVA), &ISVISIBLE_ORIG);
+    restore_site_bytes(process, image.wrapping_add(GETVISIBLE_RVA), &GETVISIBLE_ORIG);
+    restore_site_bytes(process, image.wrapping_add(DRAW_BTN_RVA), &DRAW_BTN_ORIG);
+}
+
+/// Ancienne API hooks — désormais no-op (purge seulement).
+#[cfg(windows)]
+fn install_touch_hide_hook(process: *mut std::ffi::c_void, image: u32) -> Result<(), String> {
+    uninstall_touch_hide_hook(process, image);
+    Ok(())
+}
+
+/// Restaure les sites même si la cave n'est plus connue (hooks orphelins d'un rebuild).
+#[cfg(windows)]
+fn uninstall_touch_hide_hook(process: *mut std::ffi::c_void, image: u32) {
+    let cave = TOUCH_HIDE_CAVE.swap(0, Ordering::Relaxed);
+    // Toujours réécrire les prologues d'origine si un E9 résiduel traîne.
+    force_restore_touch_hide_sites(process, image);
+    if cave != 0 {
+        unsafe {
+            VirtualFreeEx(process, cave as *mut std::ffi::c_void, 0, 0x8000);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn force_restore_touch_hide_sites(process: *mut std::ffi::c_void, image: u32) {
+    let sites: &[(u32, &[u8])] = &[
+        (image.wrapping_add(SETVISIBLE_RVA), &SETVISIBLE_ORIG),
+        (image.wrapping_add(SETENABLED_RVA), &SETENABLED_ORIG),
+        (image.wrapping_add(ISVISIBLE_RVA), &ISVISIBLE_ORIG),
+        (image.wrapping_add(GETVISIBLE_RVA), &GETVISIBLE_ORIG),
+        (image.wrapping_add(DRAW_BTN_RVA), &DRAW_BTN_ORIG),
+    ];
+    for &(site, orig) in sites {
+        let mut cur = vec![0u8; orig.len()];
+        if read_bytes(process, site as u64, &mut cur).is_err() {
+            continue;
+        }
+        if cur.as_slice() == orig {
+            continue;
+        }
+        // E9 ou stub corrompu → remettre l'original.
+        restore_site_bytes(process, site, orig);
+    }
+    let _ = patch_code(
+        process,
+        image,
+        0x2FA822,
+        &[0x6A, 0x00, 0x90],
+        &[0xFF, 0x75, 0x08],
+    );
+}
+
+/// Masquage HUD : runtime only (pas de hooks Draw/setVisible — crash / artefacts).
+#[cfg(windows)]
+fn disable_touch_controls(process: *mut std::ffi::c_void, image: u32) -> Result<(), String> {
+    // Purge d'éventuels hooks d'une session / build précédente.
+    uninstall_touch_hide_hook(process, image);
+    restore_touch_controls(process, image);
+    let _ = hide_touch_controls_runtime(process, image);
     Ok(())
 }
 
@@ -5446,6 +6102,7 @@ fn spawn_fps_mouse_watcher(app: AppHandle) {
                     let _ = restore_fire_look_gates(process, image);
                     restore_fire_look_gate_one(process, image);
                     let _ = restore_abs_look_no_center(process, image);
+                    restore_touch_controls(process, image);
                     let _ = write_exact(process, image as u64 + 0x9A4740, &[0u8]);
                 }
                 append_log(app, &format!("fps-mouse: freelook OFF reason={reason}"));
@@ -5458,7 +6115,7 @@ fn spawn_fps_mouse_watcher(app: AppHandle) {
                 restore_mgr_look_horizon_hook(process, image);
                 restore_post_6eaee0_horizon(process, image);
                 restore_identity_horizon(process, image);
-                // Annule un ancien disable_touch (cassait le sprint / AnalogJoystick).
+                // Annule un ancien disable_touch IsActive (cassait le sprint).
                 let _ = patch_code(
                     process,
                     image,
@@ -5466,6 +6123,8 @@ fn spawn_fps_mouse_watcher(app: AppHandle) {
                     &[0x32, 0xC0, 0xC3, 0x90],
                     &[0x8A, 0x41, 0x1D, 0xC3],
                 );
+                uninstall_touch_hide_hook(process, image);
+                restore_touch_controls(process, image);
                 let site = image as u64 + 0x309D50;
                 let mut cur = [0u8; 6];
                 if read_bytes(process, site, &mut cur).is_ok() && cur[0] == 0xE9 {
@@ -5523,6 +6182,9 @@ fn spawn_fps_mouse_watcher(app: AppHandle) {
                 let state = FPS_LOOK_STATE.lock().ok().and_then(|g| *g);
                 let Some((pid, image)) = state else {
                     if let Some((_, img)) = last_pid_image {
+                        if !process.is_null() {
+                            uninstall_touch_hide_hook(process, img);
+                        }
                         session_off(
                             &app,
                             process,
@@ -5545,6 +6207,9 @@ fn spawn_fps_mouse_watcher(app: AppHandle) {
 
                 if last_pid_image != Some((pid, image)) {
                     if let Some((_, oi)) = last_pid_image {
+                        if !process.is_null() {
+                            uninstall_touch_hide_hook(process, oi);
+                        }
                         session_off(
                             &app,
                             process,
@@ -5569,6 +6234,9 @@ fn spawn_fps_mouse_watcher(app: AppHandle) {
                     if process.is_null() {
                         continue;
                     }
+                    // Purge hooks orphelins (rebuild / session précédente) → évite crash load.
+                    uninstall_touch_hide_hook(process, image);
+                    restore_touch_controls(process, image);
                 }
 
                 if last_alive_check.elapsed() >= Duration::from_millis(500) {
@@ -5662,16 +6330,20 @@ fn spawn_fps_mouse_watcher(app: AppHandle) {
                     continue;
                 }
                 if !FREELOOK_AFTER_LOAD.load(Ordering::Relaxed) {
-                    session_off(
-                        &app,
-                        process,
-                        image,
-                        &mut session_on,
-                        &mut abs_look_saved,
-                        &mut abs_ret_lifted_for_tab,
-                        &mut cursor_captured,
-                        "loading",
-                    );
+                    // Pendant load/join : retirer les hooks HUD (sinon écran bloqué).
+                    if session_on || TOUCH_HIDE_CAVE.load(Ordering::Relaxed) != 0 {
+                        uninstall_touch_hide_hook(process, image);
+                        session_off(
+                            &app,
+                            process,
+                            image,
+                            &mut session_on,
+                            &mut abs_look_saved,
+                            &mut abs_ret_lifted_for_tab,
+                            &mut cursor_captured,
+                            "loading",
+                        );
+                    }
                     continue;
                 }
 
@@ -5715,6 +6387,14 @@ fn spawn_fps_mouse_watcher(app: AppHandle) {
                         &[0xC7, 0x04, 0x24, 0xCD, 0xCC, 0xCC, 0x3E],
                         &[0xC7, 0x04, 0x24, 0x00, 0x00, 0x00, 0x00],
                     );
+                    // Runtime hide only (hooks natifs retirés — stabilité).
+                    let _ = disable_touch_controls(process, image);
+                    log_touch_ctrl_vtbls(&app, process, image);
+                    let n = hide_touch_controls_runtime(process, image);
+                    append_log(
+                        &app,
+                        &format!("fps-mouse: touch HUD hide n={n} (runtime, no hooks)"),
+                    );
                     unsafe {
                         ClipCursor(std::ptr::null());
                     }
@@ -5724,6 +6404,9 @@ fn spawn_fps_mouse_watcher(app: AppHandle) {
                         "fps-mouse: freelook ON packer DX/DY (abs@2E3060 natif — Tab OK)",
                     );
                 }
+
+                // Ré-applique le masquage sélectif (le jeu réécrit parfois +0x21).
+                let _ = hide_touch_controls_runtime(process, image);
 
                 // Packer freelook (souris seulement) — pitch+yaw obj+0x58/60.
                 const PACKER_PITCH_MIN: f32 = -70.0;
@@ -7773,7 +8456,8 @@ pub fn run() {
             reveal_game_path,
             open_game_store,
             read_recent_logs,
-            set_look_settings
+            set_look_settings,
+            set_touch_hud_settings
         ])
         .setup(|app| {
             append_log(app.handle(), "launcher démarré");
